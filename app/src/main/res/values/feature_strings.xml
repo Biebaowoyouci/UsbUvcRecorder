@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="rotate_preview">旋转 90°</string>
+    <string name="hdmi_output">输出</string>
+    <string name="hdmi_output_active">输出中</string>
+    <string name="hdmi_output_title">HDMI 输出</string>
+    <string name="hdmi_output_live">输出当前 UVC 信号</string>
+    <string name="hdmi_output_file">选择视频文件输出</string>
+    <string name="hdmi_output_stop">停止 HDMI 输出</string>
+</resources>

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+    <color name="panel">#D9161A20</color>
+    <color name="panel_border">#40FFFFFF</color>
+    <color name="record_red">#E53935</color>
+    <color name="record_orange">#FB8C00</color>
+    <color name="accent">#4FC3F7</color>
+    <color name="surface">#181A20</color>
+    <color name="surface_elevated">#242730</color>
+    <color name="surface_outline">#3A3F4B</color>
+    <color name="text_secondary">#B8BCC8</color>
+</resources>

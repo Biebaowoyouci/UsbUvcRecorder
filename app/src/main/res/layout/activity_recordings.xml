@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/recordings_root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/back_button"
+            style="@style/OverlayButton"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:text="@string/back" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="18dp"
+            android:text="@string/recordings_title"
+            android:textColor="@color/white"
+            android:textSize="25sp"
+            android:textStyle="bold" />
+
+        <Space android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1" />
+
+        <Button
+            android:id="@+id/filter_all"
+            style="@style/OverlayButton"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:text="@string/all" />
+        <Button
+            android:id="@+id/filter_main"
+            style="@style/OverlayButton"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:text="@string/main_channel" />
+        <Button
+            android:id="@+id/filter_aux"
+            style="@style/OverlayButton"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:text="@string/aux_channel" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/storage_value"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="10dp"
+        android:textColor="@color/text_secondary"
+        android:textSize="13sp" />
+
+    <TextView
+        android:id="@+id/empty_view"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:gravity="center"
+        android:text="@string/empty_recordings"
+        android:textColor="@color/text_secondary"
+        android:textSize="16sp" />
+
+    <ListView
+        android:id="@+id/recording_list"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="10dp"
+        android:layout_weight="1"
+        android:divider="#22333A44"
+        android:dividerHeight="1dp"
+        android:listSelector="#224FC3F7" />
+</LinearLayout>
