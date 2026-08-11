@@ -1,4 +1,6 @@
-USB 摄像机录制 v1.7.3
+USB 摄像机录制 / USB Camera Recorder v1.7.3
+
+中文 / Chinese
 
 本版修复
 
@@ -17,3 +19,23 @@ USB 摄像机录制 v1.7.3
 - 后置 Physical 4：4096×2160 30p，方向修复并等比例全屏显示。
 - 前置 Camera 1：方向与镜像测试通过。
 - 冷启动和 Camera2 会话无崩溃。
+
+English
+
+Fixes in this release
+
+1. Phone camera orientation
+- Fixed an extra SENSOR_ORIENTATION=90° transform being applied after Camera2's SurfaceTexture had already provided the sensor transform.
+- Landscape preview now compensates only for the current display rotation, restoring the correct orientation for both rear and front cameras.
+- Fixed the front-camera mirror axis at 90°/270° so the preview remains horizontally mirrored instead of flipping vertically.
+
+2. Full-screen phone-camera aspect ratio
+- Single-device mode now uses aspect-fill scaling with centered cropping.
+- Horizontal and vertical scaling use exactly the same factor, preventing stretching, squashing, or a narrow image in the center of the screen.
+- Multi-device mode continues to fit the complete image and preserves the empty-area double-tap gesture for showing or hiding controls.
+
+3. On-device validation
+- Device: Xiaomi 25098PN5AC (pandora), connected through USB ADB.
+- Rear Physical Camera 4: 4096×2160 at 30p, with corrected orientation and proportional full-screen display.
+- Front Camera 1: orientation and mirroring tests passed.
+- Cold start and Camera2 sessions completed without crashes.
