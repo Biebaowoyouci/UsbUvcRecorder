@@ -74,10 +74,12 @@ final class MultiDeviceController {
     private int recordingRequest;
     private boolean recordingDesired;
     private boolean metersVisible;
+    private int outputRotation;
+    private int previewDisplayCompensation;
     private String audioConfigurationSignature = "";
 
     MultiDeviceController(AppCompatActivity activity, GridLayout grid,
-                          List<VideoInputDevice> devices, Listener listener) {
+                          List<UsbDevice> devices, Listener listener) {
         this.activity = activity;
         this.grid = grid;
         this.listener = listener;
@@ -147,6 +149,18 @@ final class MultiDeviceController {
     void setMetersVisible(boolean visible) {
         metersVisible = visible;
         for (Session session : sessions) session.refreshAudioMonitor(false);
+    }
+
+    void setOutputRotation(int degrees) {
+        outputRotation = AppSettings.normalizeRotation(degrees);
+        for (Session session : sessions) session.setOutputRotation(outputRotation);
+    }
+
+    void setPreviewDisplayCompensation(int degrees) {
+        previewDisplayCompensation = AppSettings.normalizeRotation(degrees);
+        for (Session session : sessions) {
+            session.setPreviewDisplayCompensation(previewDisplayCompensation);
+        }
     }
 
     void refreshAudioConfiguration() {
@@ -238,15 +252,15 @@ final class MultiDeviceController {
         notifyRecordingState();
     }
 
-    void rotateClockwise() {
-        for (Session session : sessions) session.rotateClockwise();
-    }
-
     List<LiveSource> readyLiveSources() {
         List<LiveSource> result = new ArrayList<>();
         for (Session session : sessions) {
-            if (session.ready && session.liveSource() != null) {
-                result.add(new LiveSource(session.shortLabel, session.liveSource()));
+            if (session.ready && session.source != null) {
+                int width = session.signal == null ? 1280 : session.signal.width;
+                int height = session.signal == null ? 720 : session.signal.height;
+                int fps = session.signal == null ? 30 : session.signal.fps;
+                result.add(new LiveSource(session.shortLabel, session.source,
+                        width, height, fps));
             }
         }
         return result;
@@ -395,10 +409,16 @@ final class MultiDeviceController {
     static final class LiveSource {
         final String label;
         final UvcSurfaceSource source;
+        final int width;
+        final int height;
+        final int fps;
 
-        LiveSource(String label, UvcSurfaceSource source) {
+        LiveSource(String label, UvcSurfaceSource source, int width, int height, int fps) {
             this.label = label;
             this.source = source;
+            this.width = width;
+            this.height = height;
+            this.fps = fps;
         }
     }
 
@@ -413,10 +433,8 @@ final class MultiDeviceController {
     }
 
     private final class Session implements DirectUvcCameraSource.Listener,
-            PhoneCameraSource.Listener,
             RecordingController.Listener, SurfaceHolder.Callback,
             TextureView.SurfaceTextureListener {
-        final VideoInputDevice input;
         final UsbDevice device;
         final int index;
         final String shortLabel;
@@ -430,7 +448,6 @@ final class MultiDeviceController {
         final AudioLevelMonitor audioMonitor;
         final Handler handler = new Handler(Looper.getMainLooper());
         DirectUvcCameraSource source;
-        PhoneCameraSource phoneSource;
         RecordingController recorder;
         Surface textureSurface;
         List<Size> modes = Collections.emptyList();
@@ -458,7 +475,7 @@ final class MultiDeviceController {
                         && SystemClock.elapsedRealtime() - lastTextureFrameAt > FRAME_STALL_MS) {
                     listener.onMultiWarning(shortLabel, "画面停滞，正在只重启该路输入");
                     Size restart = selectedMode == null ? null : selectedMode.clone();
-                    if (restart != null && liveSource() != null) {
+                    if (restart != null && source != null && source.isOpened()) {
                         startMode(restart, true);
                         return;
                     }
@@ -467,14 +484,13 @@ final class MultiDeviceController {
             }
         };
 
-        Session(VideoInputDevice input, int index) {
-            this.input = input;
-            this.device = input.usbDevice;
+        Session(UsbDevice device, int index) {
+            this.device = device;
             this.index = index;
-            String product = input.isUsb() ? device.getProductName() : input.label;
+            String product = device.getProductName();
             shortLabel = product == null || product.trim().isEmpty()
-                    ? "输入 " + (index + 1) : product;
-            fileTag = input.fileTag(index);
+                    ? "UVC " + (index + 1) : product;
+            fileTag = UsbDeviceCatalog.fileTag(device, index);
 
             tile = new FrameLayout(activity);
             tile.setBackgroundColor(Color.BLACK);
@@ -539,19 +555,13 @@ final class MultiDeviceController {
             });
             directView.getHolder().addCallback(this);
             grid.addView(tile);
-            setStatus(input.isPhoneCamera() ? "等待手机摄像头…" : "等待 USB 权限…");
+            setStatus("等待 USB 权限…");
         }
 
         void start() {
             if (released || sessionReleased) return;
-            if (input.isPhoneCamera()) {
-                phoneSource = new PhoneCameraSource(activity, input.logicalCameraId,
-                        input.physicalCameraId, this);
-                phoneSource.start();
-                return;
-            }
             source = new DirectUvcCameraSource(activity, device.getDeviceId(), this);
-            source.setOutputRotation(rotation);
+            setOutputRotation(outputRotation);
             source.start();
         }
 
@@ -569,10 +579,6 @@ final class MultiDeviceController {
                 source.release();
                 source = null;
             }
-            if (phoneSource != null) {
-                phoneSource.release();
-                phoneSource = null;
-            }
             if (textureSurface != null) {
                 textureSurface.release();
                 textureSurface = null;
@@ -589,16 +595,12 @@ final class MultiDeviceController {
 
         UvcSurfaceSource recordingSource() {
             if (isSharedAudioEnabled()) {
-                return new AudioOverrideSurfaceSource(liveSource(), audioRouter);
+                return new AudioOverrideSurfaceSource(source, audioRouter);
             }
             return independentAudioSource();
         }
 
         UvcSurfaceSource independentAudioSource() {
-            if (input.isPhoneCamera()) {
-                audioMeter.setContentDescription(shortLabel + " 手机麦克风");
-                return phoneSource;
-            }
             AudioAssignment assignment = audioAssignments.get(UsbDeviceCatalog.stableKey(device));
             if (assignment != null) {
                 audioMeter.setContentDescription(shortLabel + " 独立音频："
@@ -612,19 +614,18 @@ final class MultiDeviceController {
         }
 
         void recreateRecorder() {
-            if (!ready || liveSource() == null || signal == null || isRecording()) return;
+            if (!ready || source == null || signal == null || isRecording()) return;
             if (recorder != null) recorder.release();
             recorder = new RecordingController(activity, recordingSource(),
                     signal, this, fileTag, false);
         }
 
         void refreshAudioMonitor(boolean force) {
-            boolean enabled = AppSettings.isUsbAudioEnabled(activity) && ready
-                    && liveSource() != null;
+            boolean enabled = AppSettings.isUsbAudioEnabled(activity) && ready && source != null;
             audioMeter.setPanelOpacity(AppSettings.getButtonOpacity(activity));
             audioMeter.setVisibility(enabled && metersVisible ? View.VISIBLE : View.GONE);
             String next = enabled && metersVisible && !isSharedAudioEnabled()
-                    ? input.stableKey : "";
+                    ? UsbDeviceCatalog.stableKey(device) : "";
             if (!force && next.equals(audioMonitorSignature)) return;
             audioMonitorSignature = next;
             audioMonitor.stop();
@@ -646,16 +647,17 @@ final class MultiDeviceController {
             audioMeter.setUnavailable();
         }
 
-        void rotateClockwise() {
-            if (input.isPhoneCamera()) {
-                listener.onMultiWarning(shortLabel,
-                        "手机摄像头按传感器方向输出，当前版本不额外旋转该路");
-                return;
-            }
-            rotation = (rotation + 90) % 360;
+        void setOutputRotation(int degrees) {
+            rotation = AppSettings.normalizeRotation(degrees);
             if (source != null) source.setOutputRotation(rotation);
             updateModeTouchTarget();
             updateStatus();
+        }
+
+        void setPreviewDisplayCompensation(int degrees) {
+            float compensation = AppSettings.normalizeRotation(degrees);
+            textureView.setRotation(compensation);
+            directView.setRotation(compensation);
         }
 
         boolean isPointOnVideo(float rawX, float rawY) {
@@ -673,50 +675,13 @@ final class MultiDeviceController {
             int availableWidth = tile.getWidth();
             int availableHeight = tile.getHeight();
             if (availableWidth <= 0 || availableHeight <= 0) return;
-            int sourceWidth = selectedMode == null ? 16 : selectedMode.width;
-            int sourceHeight = selectedMode == null ? 9 : selectedMode.height;
-            int displayRotation = input.isPhoneCamera()
-                    ? PhoneCameraCatalog.relativeRotation(activity, input) : rotation;
-            if (displayRotation == 90 || displayRotation == 270) {
-                int swap = sourceWidth;
-                sourceWidth = sourceHeight;
-                sourceHeight = swap;
-            }
-            float sourceAspect = sourceWidth / (float) Math.max(1, sourceHeight);
-            float targetAspect = availableWidth / (float) Math.max(1, availableHeight);
-            int width;
-            int height;
-            if (sourceAspect >= targetAspect) {
-                width = availableWidth;
-                height = Math.max(1, Math.round(width / sourceAspect));
-            } else {
-                height = availableHeight;
-                width = Math.max(1, Math.round(height * sourceAspect));
-            }
             FrameLayout.LayoutParams params = (FrameLayout.LayoutParams)
                     modeTouchTarget.getLayoutParams();
-            if (params.width != width || params.height != height) {
-                params.width = width;
-                params.height = height;
+            if (params.width != availableWidth || params.height != availableHeight) {
+                params.width = availableWidth;
+                params.height = availableHeight;
                 params.gravity = Gravity.CENTER;
                 modeTouchTarget.setLayoutParams(params);
-            }
-            if (input.isPhoneCamera()) {
-                boolean quarterTurn = displayRotation == 90 || displayRotation == 270;
-                int layoutWidth = quarterTurn ? height : width;
-                int layoutHeight = quarterTurn ? width : height;
-                FrameLayout.LayoutParams textureParams = (FrameLayout.LayoutParams)
-                        textureView.getLayoutParams();
-                textureParams.width = layoutWidth;
-                textureParams.height = layoutHeight;
-                textureParams.gravity = Gravity.CENTER;
-                textureView.setLayoutParams(textureParams);
-                textureView.setPivotX(layoutWidth / 2f);
-                textureView.setPivotY(layoutHeight / 2f);
-                textureView.setRotation(displayRotation);
-                boolean mirror = PhoneCameraCatalog.isFrontFacing(activity, input);
-                textureView.setScaleX(mirror && !quarterTurn ? -1f : 1f);
-                textureView.setScaleY(mirror && quarterTurn ? -1f : 1f);
             }
         }
 
@@ -759,41 +724,6 @@ final class MultiDeviceController {
         }
 
         @Override
-        public void onOpened(List<Size> sizes) {
-            if (sessionReleased || !input.isPhoneCamera()) return;
-            opened = true;
-            formats = Collections.emptyList();
-            modes = uniqueSizes(sizes);
-            if (modes.isEmpty()) {
-                setStatus("手机摄像头没有 4K、1080P 或 720P 输出");
-                return;
-            }
-            AppSettings.SavedSignalMode saved = AppSettings.getSignalMode(
-                    activity, input.stableKey);
-            fallbacks = buildFallbacks(modes, saved);
-            fallbackIndex = 0;
-            bandwidthIndex = 0;
-            startWhenSurfaceReady(fallbacks.get(0), true);
-        }
-
-        @Override
-        public void onPreviewConfigured(Size mode) {
-            // Per-request callback in startPhoneMode owns readiness.
-        }
-
-        @Override
-        public void onClosed() {
-            if (input.isPhoneCamera()) markNotReady("手机摄像头已关闭");
-        }
-
-        @Override
-        public void onError(Throwable error) {
-            if (!input.isPhoneCamera()) return;
-            markNotReady("手机摄像头失败：" + readable(error));
-            listener.onMultiError(shortLabel, readable(error), error);
-        }
-
-        @Override
         public void onClosed(UsbDevice closed) {
             markNotReady("视频已关闭");
         }
@@ -816,9 +746,7 @@ final class MultiDeviceController {
 
         @Override
         public void surfaceCreated(@NonNull SurfaceHolder holder) {
-            if (input.isUsb() && opened && selectedMode != null && !ready) {
-                startMode(selectedMode, true);
-            }
+            if (opened && selectedMode != null && !ready) startMode(selectedMode, true);
         }
 
         @Override
@@ -834,26 +762,18 @@ final class MultiDeviceController {
         public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surfaceTexture,
                                               int width, int height) {
             replaceTextureSurface(new Surface(surfaceTexture));
-            if (input.isPhoneCamera()) {
-                if (selectedMode != null) {
-                    surfaceTexture.setDefaultBufferSize(selectedMode.width, selectedMode.height);
-                    startPhoneMode(selectedMode);
-                }
-                return;
-            }
             attachTexture(width, height);
         }
 
         @Override
         public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture surfaceTexture,
                                                 int width, int height) {
-            if (input.isUsb()) attachTexture(width, height);
+            attachTexture(width, height);
         }
 
         @Override
         public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture surfaceTexture) {
             if (source != null) source.setScreenSurface(null, 0, 0);
-            if (input.isPhoneCamera()) markNotReady("等待手机摄像头预览画布…");
             replaceTextureSurface(null);
             return true;
         }
@@ -868,11 +788,7 @@ final class MultiDeviceController {
             handler.removeCallbacksAndMessages(null);
             recorder = new RecordingController(activity, recordingSource(),
                     signal, this, fileTag, false);
-            if (input.isUsb()) {
-                AppSettings.saveSignalMode(activity, device, selectedMode, bandwidthIndex);
-            } else {
-                AppSettings.saveSignalMode(activity, input.stableKey, selectedMode, 0);
-            }
+            AppSettings.saveSignalMode(activity, device, selectedMode, bandwidthIndex);
             updateStatus();
             refreshAudioMonitor(true);
             notifyReadiness();
@@ -892,16 +808,6 @@ final class MultiDeviceController {
         void startWhenSurfaceReady(Size mode, boolean allowFallback) {
             selectedMode = mode.clone();
             updateModeTouchTarget();
-            if (input.isPhoneCamera()) {
-                SurfaceTexture texture = textureView.getSurfaceTexture();
-                if (texture != null && textureSurface != null && textureSurface.isValid()) {
-                    texture.setDefaultBufferSize(mode.width, mode.height);
-                    startPhoneMode(mode);
-                } else {
-                    setStatus("等待手机摄像头预览画布…");
-                }
-                return;
-            }
             if (directView.getHolder().getSurface().isValid()) {
                 startMode(mode, allowFallback);
             } else {
@@ -910,10 +816,6 @@ final class MultiDeviceController {
         }
 
         void startMode(Size mode, boolean allowFallback) {
-            if (input.isPhoneCamera()) {
-                startPhoneMode(mode);
-                return;
-            }
             if (source == null || !source.isOpened()) return;
             selectedMode = mode.clone();
             updateModeTouchTarget();
@@ -964,61 +866,6 @@ final class MultiDeviceController {
                     DIRECT_FRAME_TIMEOUT_MS);
         }
 
-        void startPhoneMode(Size mode) {
-            if (phoneSource == null || textureSurface == null || !textureSurface.isValid()) return;
-            selectedMode = mode.clone();
-            SurfaceTexture texture = textureView.getSurfaceTexture();
-            if (texture != null) texture.setDefaultBufferSize(mode.width, mode.height);
-            int request = ++generation;
-            handler.removeCallbacksAndMessages(null);
-            if (recorder != null) {
-                recorder.release();
-                recorder = null;
-            }
-            audioMonitorSignature = "";
-            audioMonitor.stop();
-            audioMeter.setUnavailable();
-            audioMeter.setVisibility(View.GONE);
-            ready = false;
-            routerReady = false;
-            lastTextureFrameAt = 0;
-            recordingActive = false;
-            signal = SignalInfo.from(mode, Collections.emptyList());
-            directView.setVisibility(View.INVISIBLE);
-            textureView.setAlpha(1f);
-            setStatus("正在打开 " + compactMode(signal));
-            notifyReadiness();
-            phoneSource.startPreview(mode, textureSurface,
-                    new PhoneCameraSource.PreviewCallback() {
-                        @Override
-                        public void onConfigured() {
-                            if (request != generation) return;
-                            routerReady = true;
-                            setStatus("正在确认手机摄像头画面…");
-                            handler.postDelayed(() -> retryPhoneMode(request, mode,
-                                    "分屏画面没有收到帧"), TEXTURE_FRAME_TIMEOUT_MS);
-                        }
-
-                        @Override
-                        public void onError(Throwable error) {
-                            retryPhoneMode(request, mode, readable(error));
-                        }
-                    });
-        }
-
-        void retryPhoneMode(int request, Size mode, String reason) {
-            if (request != generation || phoneSource == null) return;
-            handler.removeCallbacksAndMessages(null);
-            if (fallbackIndex + 1 < fallbacks.size()) {
-                fallbackIndex++;
-                Size next = fallbacks.get(fallbackIndex);
-                setStatus("自动尝试 " + sessionModeLabel(next));
-                handler.postDelayed(() -> startPhoneMode(next), 250);
-                return;
-            }
-            markNotReady("手机摄像头无稳定画面：" + reason);
-        }
-
         void prepareRouter(int request, Size mode, boolean allowFallback) {
             if (request != generation || source == null) return;
             handler.removeCallbacksAndMessages(null);
@@ -1047,10 +894,6 @@ final class MultiDeviceController {
                     && textureSurface.isValid() && width > 0 && height > 0) {
                 source.setScreenSurface(textureSurface, width, height);
             }
-        }
-
-        UvcSurfaceSource liveSource() {
-            return input.isPhoneCamera() ? phoneSource : source;
         }
 
         void retryMode(int request, Size mode, boolean allowFallback, String reason) {

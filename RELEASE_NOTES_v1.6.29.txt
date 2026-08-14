@@ -1,0 +1,17 @@
+UsbUvcRecorder v1.6.29
+
+1. 修复抖音等 CDN 的 HTTPS/HTTP-FLV 拉流失败：新增 FLV codec-id 12 H.265/HEVC 解封装，不再误报“服务器没有打开”并无限重连。
+2. 参考“手机导播台”的 VLC 多协议拉流逻辑，为 HTTP-FLV 增加移动端 User-Agent、跨协议重定向和 3 秒连接/读取超时。
+3. H.265-FLV 仍复用当前 APP 的 PCM 音频、声音电平、录制、RTMP 转推和 HDMI 输出链路。
+4. 拉流、拉流旋转、UVC 和 UVC 旋转分别保留独立方向状态，拉流作为完整输入源继续支持预览、录制和输出。
+5. 保留 v1.6.28 的竖屏 UVC 旋转修复：对 Pocket 4 等“竖屏有效画面封装在横屏 UVC 帧”信号，90°/270° 旋转只移出信号自带黑柱，有效画面等比、不拉伸。
+6. 根据实际解码帧动态测量网络流帧率，解决本次 25fps 抖音流因 FLV 未携带帧率字段而误显示 30p 的问题。
+
+English
+
+1. Fixed HTTPS/HTTP-FLV playback failures with CDNs such as Douyin by adding FLV codec ID 12 H.265/HEVC demuxing, preventing false “server not open” errors and endless reconnect loops.
+2. Added a mobile User-Agent, cross-protocol redirects, and 3-second connection/read timeouts for HTTP-FLV, following the multi-protocol playback behavior used by mobile live-production apps.
+3. H.265-FLV continues to reuse the app's existing PCM audio, audio-level meter, recording, RTMP restreaming, and HDMI output pipelines.
+4. Network playback, network-playback rotation, UVC, and UVC rotation now retain independent orientation states. Network playback remains a full input source with preview, recording, and output support.
+5. Preserved the v1.6.28 portrait UVC rotation fix. For signals such as Pocket 4 that package portrait content inside a landscape UVC frame, 90°/270° rotation removes only the signal's built-in black bars while preserving aspect ratio without stretching.
+6. Network-stream frame rate is now measured dynamically from decoded frames, fixing 25 fps Douyin streams being reported as 30p when the FLV stream does not carry frame-rate metadata.

@@ -7,6 +7,10 @@ import android.view.Surface;
 interface UvcSurfaceSource {
     void addRecordingSurface(Surface surface) throws Exception;
 
+    default void addRecordingSurface(Surface surface, int width, int height) throws Exception {
+        addRecordingSurface(surface);
+    }
+
     void removeRecordingSurface(Surface surface);
 
     default void addDisplaySurface(Surface surface, int width, int height) throws Exception {
@@ -16,10 +20,30 @@ interface UvcSurfaceSource {
     default void removeDisplaySurface(Surface surface) {
     }
 
+    default void setScreenSurface(Surface surface, int width, int height) {
+    }
+
     default void setOutputRotation(int degrees) {
     }
 
     default int getOutputRotation() {
+        return 0;
+    }
+
+    /**
+     * Latest source-video timestamp in microseconds, or {@link Long#MIN_VALUE}
+     * when the source uses the device monotonic clock implicitly.
+     */
+    default long getVideoTimelinePositionUs() {
+        return Long.MIN_VALUE;
+    }
+
+    /**
+     * Increments when a live source is rebuilt and its media timestamps can
+     * restart from a different origin. Recorder tracks use this to re-anchor
+     * both audio and video onto one continuous file timeline.
+     */
+    default int getTimelineGeneration() {
         return 0;
     }
 

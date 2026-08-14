@@ -2,9 +2,12 @@ package com.codex.uvcrecorder;
 
 import android.content.Context;
 import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbManager;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.Process;
+import android.os.SystemClock;
 import android.opengl.Matrix;
 import android.util.Log;
 import android.view.Surface;
@@ -20,7 +23,9 @@ import com.serenegiant.usb.USBMonitor.USBException;
 import com.serenegiant.usb.UVCCamera;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -61,7 +66,9 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
     private final HandlerThread cameraThread = new HandlerThread("direct-libuvc-camera");
     private final Handler cameraHandler;
     private final USBMonitor usbMonitor;
+    private final UsbManager usbManager;
     private final AtomicInteger previewRequest = new AtomicInteger();
+    private final Map<Integer, int[]> recordingSurfaces = new HashMap<>();
 
     private volatile boolean released;
     private volatile boolean opened;
@@ -80,6 +87,35 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
     private volatile int inputHeight;
     private volatile int outputRotation;
     private int openRetryCount;
+    private volatile boolean opening;
+    private volatile boolean permissionRequestPending;
+    private long lastPermissionRequestAt;
+
+    private final Runnable deviceProbe = new Runnable() {
+        @Override
+        public void run() {
+            if (released) return;
+            if (!opened && !opening && !permissionRequestPending && usbManager != null) {
+                UsbDevice selected = currentDevice;
+                if (selected == null) {
+                    for (UsbDevice candidate : usbManager.getDeviceList().values()) {
+                        if (UsbDeviceCatalog.isVideoInput(candidate) && matchesTarget(candidate)) {
+                            currentDevice = candidate;
+                            selected = candidate;
+                            openRetryCount = 0;
+                            listener.onAttach(candidate);
+                            break;
+                        }
+                    }
+                }
+                if (selected != null
+                        && SystemClock.elapsedRealtime() - lastPermissionRequestAt >= 1_200L) {
+                    requestPermission(selected);
+                }
+            }
+            mainHandler.postDelayed(this, 1_500L);
+        }
+    };
 
     DirectUvcCameraSource(Context context, Listener listener) {
         this(context, -1, listener);
@@ -105,12 +141,20 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
         targetProductId = target == null ? -1 : target.getProductId();
         targetProductName = target == null ? null : target.getProductName();
         cameraThread.start();
+        try {
+            Process.setThreadPriority(cameraThread.getThreadId(), Process.THREAD_PRIORITY_DISPLAY);
+        } catch (Throwable ignored) {
+        }
         cameraHandler = new Handler(cameraThread.getLooper());
         usbMonitor = new USBMonitor(context.getApplicationContext(), usbListener, mainHandler);
+        usbManager = (UsbManager) context.getSystemService(Context.USB_SERVICE);
     }
 
     void start() {
-        if (!released) usbMonitor.register();
+        if (released) return;
+        usbMonitor.register();
+        mainHandler.removeCallbacks(deviceProbe);
+        mainHandler.post(deviceProbe);
     }
 
     boolean isOpened() {
@@ -137,9 +181,11 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
         cameraHandler.post(() -> {
             RendererHolder router = recordingRouter;
             if (!released && router != null && router.isRunning()) {
-                router.rotateTo(normalized);
+                // Every attached output owns a complete rotation/scale matrix.
+                // Rotating the holder as well would apply the quarter turn twice.
                 applyScreenTransform(router);
                 applyDisplayTransform(router);
+                applyRecordingTransforms(router);
             }
         });
     }
@@ -149,7 +195,8 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
         return outputRotation;
     }
 
-    void setScreenSurface(Surface surface, int width, int height) {
+    @Override
+    public void setScreenSurface(Surface surface, int width, int height) {
         screenSurface = surface;
         screenWidth = width;
         screenHeight = height;
@@ -196,6 +243,66 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
                 active.startPreview();
                 postPreviewConfigured(request, callback);
             } catch (Throwable error) {
+                stopPreviewLocked(active);
+                postPreviewError(request, callback, error);
+            }
+        });
+    }
+
+    /**
+     * Starts UVC only once, directly into the GPU router. This avoids copying three
+     * full RGBX frames into Java and then stopping/restarting the capture card.
+     */
+    void startRoutedPreview(Size mode, float bandwidthFactor, Surface surface,
+                            int surfaceWidth, int surfaceHeight,
+                            PreviewCallback callback) {
+        screenSurface = surface;
+        screenWidth = surfaceWidth;
+        screenHeight = surfaceHeight;
+        final int request = previewRequest.incrementAndGet();
+        cameraHandler.post(() -> {
+            if (released || request != previewRequest.get()) return;
+            UVCCamera active = camera;
+            if (active == null || !opened) {
+                postPreviewError(request, callback,
+                        new IllegalStateException("UVC 摄像头尚未打开"));
+                return;
+            }
+            AtomicBoolean completed = new AtomicBoolean(false);
+            try {
+                stopPreviewLocked(active);
+                if (request != previewRequest.get()) return;
+                active.setPreviewSize(mode.clone(), bandwidthFactor);
+                inputWidth = mode.width;
+                inputHeight = mode.height;
+                AtomicInteger routedFrames = new AtomicInteger();
+                RendererHolder nextRouter = new RendererHolder(mode.width, mode.height,
+                        new RendererHolderCallback() {
+                            @Override
+                            public void onPrimarySurfaceCreate(Surface primary) {
+                            }
+
+                            @Override
+                            public void onFrameAvailable() {
+                                if (routedFrames.incrementAndGet() >= 2
+                                        && completed.compareAndSet(false, true)) {
+                                    postPreviewConfigured(request, callback);
+                                }
+                            }
+
+                            @Override
+                            public void onPrimarySurfaceDestroy() {
+                            }
+                        });
+                recordingRouter = nextRouter;
+                active.setPreviewDisplay(nextRouter.getPrimarySurface());
+                active.setFrameCallback(null, UVCCamera.PIXEL_FORMAT_RGBX);
+                attachScreenToRouter(nextRouter, surface);
+                active.startPreview();
+                Log.i(TAG, "single-pass routed preview " + mode.width + "x" + mode.height
+                        + " fps=" + mode.fps + " bandwidth=" + bandwidthFactor);
+            } catch (Throwable error) {
+                completed.set(true);
                 stopPreviewLocked(active);
                 postPreviewError(request, callback, error);
             }
@@ -256,10 +363,11 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
                         @Override
                         public void onPrimarySurfaceDestroy() {
                         }
-                    });
+            });
             inputWidth = mode.width;
             inputHeight = mode.height;
-            router.rotateTo(outputRotation);
+            // Keep the holder's global matrix at identity; per-surface matrices
+            // below independently preserve preview/recording/output aspect ratios.
             active.setPreviewDisplay(router.getPrimarySurface());
             recordingRouter = router;
             attachedScreenSurface = null;
@@ -286,6 +394,13 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
 
     @Override
     public void addRecordingSurface(Surface surface) {
+        int width = getRecordingWidth(inputWidth, inputHeight);
+        int height = getRecordingHeight(inputWidth, inputHeight);
+        addRecordingSurface(surface, width, height);
+    }
+
+    @Override
+    public void addRecordingSurface(Surface surface, int width, int height) {
         if (surface == null || !surface.isValid()) {
             throw new IllegalArgumentException("编码器 Surface 无效");
         }
@@ -293,13 +408,22 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
         if (!opened || router == null || !router.isRunning()) {
             throw new IllegalStateException("UVC 录制分流尚未就绪");
         }
-        router.addSlaveSurface(surface.hashCode(), surface, true);
+        int id = surface.hashCode();
+        router.addSlaveSurface(id, surface, true);
+        synchronized (recordingSurfaces) {
+            recordingSurfaces.put(id, new int[]{width, height});
+        }
+        float[] matrix = createOutputTransform(width, height);
+        if (matrix != null) router.setSlaveMvpMatrix(id, matrix);
     }
 
     @Override
     public void removeRecordingSurface(Surface surface) {
         RendererHolder router = recordingRouter;
         if (surface == null || router == null) return;
+        synchronized (recordingSurfaces) {
+            recordingSurfaces.remove(surface.hashCode());
+        }
         try {
             router.removeSlaveSurface(surface.hashCode());
         } catch (Throwable ignored) {
@@ -370,7 +494,10 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
         int targetHeight = screenHeight;
         if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return;
 
-        float[] matrix = createOutputTransform(targetWidth, targetHeight);
+        // Keep ordinary and native-portrait UVC modes complete. A quarter-turned
+        // landscape raster uses the packed-portrait path, which removes only its
+        // encoded black pillars instead of shrinking the visible picture.
+        float[] matrix = createOutputTransform(targetWidth, targetHeight, true);
         if (matrix == null) return;
         try {
             router.setSlaveMvpMatrix(SCREEN_SURFACE_ID, matrix);
@@ -390,28 +517,40 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
         }
     }
 
+    private void applyRecordingTransforms(RendererHolder router) {
+        synchronized (recordingSurfaces) {
+            for (Map.Entry<Integer, int[]> entry : recordingSurfaces.entrySet()) {
+                int[] size = entry.getValue();
+                float[] matrix = createOutputTransform(size[0], size[1]);
+                if (matrix == null) continue;
+                try {
+                    router.setSlaveMvpMatrix(entry.getKey(), matrix);
+                } catch (IllegalStateException ignored) {
+                }
+            }
+        }
+    }
+
     private float[] createOutputTransform(int targetWidth, int targetHeight) {
+        return createOutputTransform(targetWidth, targetHeight, false);
+    }
+
+    private float[] createOutputTransform(int targetWidth, int targetHeight,
+                                          boolean screenPreview) {
         int sourceWidth = inputWidth;
         int sourceHeight = inputHeight;
         if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
             return null;
         }
-        boolean quarterTurn = outputRotation == 90 || outputRotation == 270;
-        float rotatedWidth = quarterTurn ? sourceHeight : sourceWidth;
-        float rotatedHeight = quarterTurn ? sourceWidth : sourceHeight;
-        float sourceAspect = rotatedWidth / rotatedHeight;
-        float targetAspect = targetWidth / (float) targetHeight;
-        float scaleX = 1f;
-        float scaleY = 1f;
-        if (targetAspect > sourceAspect) {
-            scaleX = sourceAspect / targetAspect;
-        } else {
-            scaleY = targetAspect / sourceAspect;
-        }
+        float[] scale = screenPreview
+                ? VideoLayout.uvcPreviewScale(sourceWidth, sourceHeight,
+                outputRotation, targetWidth, targetHeight)
+                : VideoLayout.centerCropScale(sourceWidth, sourceHeight,
+                outputRotation, targetWidth, targetHeight);
 
         float[] matrix = new float[16];
         Matrix.setIdentityM(matrix, 0);
-        Matrix.scaleM(matrix, 0, scaleX, scaleY, 1f);
+        Matrix.scaleM(matrix, 0, scale[0], scale[1], 1f);
         Matrix.rotateM(matrix, 0, outputRotation, 0f, 0f, -1f);
         return matrix;
     }
@@ -419,6 +558,7 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
     void release() {
         if (released) return;
         released = true;
+        mainHandler.removeCallbacks(deviceProbe);
         previewRequest.incrementAndGet();
         cameraHandler.post(() -> {
             try {
@@ -449,7 +589,7 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
                         openRetryCount = 0;
                         listener.onAttach(device);
                     }
-                    usbMonitor.requestPermission(device);
+                    requestPermission(device);
                 }
 
                 @Override
@@ -462,6 +602,8 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
                     // keeping the old id here would make us miss that new attach callback.
                     currentDevice = null;
                     openRetryCount = 0;
+                    opening = false;
+                    permissionRequestPending = false;
                     cameraHandler.post(() -> {
                         closeCameraLocked();
                         mainHandler.post(() -> {
@@ -475,6 +617,9 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
                                          boolean createNew) {
                     if (released || currentDevice == null
                             || currentDevice.getDeviceId() != device.getDeviceId()) return;
+                    permissionRequestPending = false;
+                    if (opening || opened) return;
+                    opening = true;
                     cameraHandler.post(() -> openCamera(device, ctrlBlock));
                 }
 
@@ -490,11 +635,14 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
                             && currentDevice.getDeviceId() == device.getDeviceId()) {
                         currentDevice = null;
                     }
+                    opening = false;
+                    permissionRequestPending = false;
                     if (!released) listener.onCancel(device);
                 }
 
                 @Override
                 public void onError(UsbDevice device, USBException error) {
+                    permissionRequestPending = false;
                     postError(device, error);
                     scheduleOpenRetry(device);
                 }
@@ -510,25 +658,30 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
     }
 
     private void scheduleOpenRetry(UsbDevice device) {
-        if (released || opened || device == null || openRetryCount >= 3) return;
-        int retry = ++openRetryCount;
+        if (released || opened || device == null) return;
+        opening = false;
+        int retry = openRetryCount = Math.min(1000, openRetryCount + 1);
         mainHandler.postDelayed(() -> {
             UsbDevice selected = currentDevice;
-            if (released || opened || selected == null
+            if (released || opened || opening || selected == null
                     || selected.getDeviceId() != device.getDeviceId()) return;
-            Log.w(TAG, "retrying USB open " + retry + "/3 for " + device.getDeviceName());
-            usbMonitor.requestPermission(device);
-        }, 900L * retry);
+            Log.w(TAG, "retrying USB open " + retry + " for " + device.getDeviceName());
+            requestPermission(device);
+        }, Math.min(4_000L, 600L * retry));
     }
 
     private void openCamera(UsbDevice device, UsbControlBlock ctrlBlock) {
-        if (released || opened) return;
+        if (released || opened) {
+            opening = false;
+            return;
+        }
         UVCCamera candidate = new UVCCamera(null);
         try {
             int result = candidate.open(ctrlBlock);
             if (result != 0) throw new IllegalStateException("libuvc 打开失败，错误码 " + result);
             camera = candidate;
             opened = true;
+            opening = false;
             openRetryCount = 0;
             List<Size> sizes = candidate.getSupportedSizeList();
             List<Format> formats = candidate.getSupportedFormatList();
@@ -548,10 +701,24 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
                         formats == null ? Collections.emptyList() : formats);
             });
         } catch (Throwable error) {
+            opening = false;
             try {
                 candidate.destroy(true);
             } catch (Throwable ignored) {
             }
+            postError(device, error);
+            scheduleOpenRetry(device);
+        }
+    }
+
+    private void requestPermission(UsbDevice device) {
+        if (released || opened || opening || permissionRequestPending || device == null) return;
+        lastPermissionRequestAt = SystemClock.elapsedRealtime();
+        permissionRequestPending = true;
+        try {
+            usbMonitor.requestPermission(device);
+        } catch (Throwable error) {
+            permissionRequestPending = false;
             postError(device, error);
             scheduleOpenRetry(device);
         }
@@ -577,6 +744,9 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
         displaySurfaceId = 0;
         displayWidth = 0;
         displayHeight = 0;
+        synchronized (recordingSurfaces) {
+            recordingSurfaces.clear();
+        }
         if (router != null) {
             try {
                 router.release();
@@ -590,6 +760,8 @@ final class DirectUvcCameraSource implements UvcSurfaceSource {
         camera = null;
         boolean wasOpened = opened;
         opened = false;
+        opening = false;
+        permissionRequestPending = false;
         if (active != null) {
             stopPreviewLocked(active);
             try {

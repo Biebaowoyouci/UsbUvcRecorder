@@ -1,0 +1,16 @@
+UsbUvcRecorder v1.6.27
+
+- 修复 UVC 预览画面超出屏幕的问题：手机预览改为完整等比显示，不再裁掉画面边缘。
+- 预览适配只影响手机屏幕；录制文件、RTMP 推流与 HDMI 输出继续使用既有输出构图。
+- 拉流地址新增 HTTP/HTTPS-FLV 支持，保留 RTMP 拉流；根据 URL 协议自动选择 Media3 HTTP 或 RTMP 数据源。
+- 放行直播服务器常用的明文 HTTP-FLV 地址；HTTPS-FLV 仍通过 TLS 连接。
+- 设置页更新地址校验与提示，支持 rtmp://、http://、https:// 完整拉流地址。
+- 设置页新增“系统摄像头兼容状态”，检测 Android Camera2 是否已由厂商系统注册外接摄像头。
+- 普通 APK 无权向 CameraManager 注册摄像头。抖音、快手等应用要识别 UVC，手机系统必须启用 External Camera Provider/HAL；GitHub 的替换方案依赖 Root、Magisk/LSPosed 并逐个注入目标应用，不作为 Android 12–16 通用功能集成。
+
+验证
+
+- Android 16 小米实机已安装 versionCode 38 / versionName 1.6.27。
+- Android 16 实机通过 ADB 反向端口拉取 1280 × 720、30p、H.264/AAC 的 HTTP-FLV 测试流；播放器由 BUFFERING 进入 READY，并识别网络音频。
+- 实机系统只注册 Camera2 ID 0、1，没有外接 Camera2；APP 内直接 UVC 功能不受影响，但其他应用不会把它识别为系统镜头。
+- 单元测试共 30 项，失败 0、错误 0。

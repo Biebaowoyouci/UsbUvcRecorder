@@ -30,10 +30,6 @@ public final class SignalInfo {
     }
 
     public static SignalInfo from(Size size, List<Format> formats) {
-        if (size.type == PhoneCameraCatalog.FRAME_TYPE_CAMERA2) {
-            return new SignalInfo(size.width, size.height, Math.max(1, size.fps), size.type,
-                    "Camera2", formatRate(size.fps), false);
-        }
         double exactRate = size.fps;
         int interlaceFlags = 0;
         if (formats != null) {
@@ -65,6 +61,14 @@ public final class SignalInfo {
                 : "UVC(type " + size.type + ")";
         return new SignalInfo(size.width, size.height, Math.max(1, size.fps), size.type,
                 format, rate, interlaced);
+    }
+
+    public static SignalInfo network(int width, int height, int fps, String formatName) {
+        String format = formatName == null || formatName.trim().isEmpty()
+                ? "网络流" : formatName.trim();
+        int safeFps = Math.max(1, fps);
+        return new SignalInfo(width, height, safeFps, -1, format,
+                formatRate(safeFps), false);
     }
 
     public String displayText() {

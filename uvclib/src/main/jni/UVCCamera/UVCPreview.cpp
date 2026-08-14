@@ -477,7 +477,15 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
 void UVCPreview::addPreviewFrame(uvc_frame_t *frame) {
 
     pthread_mutex_lock(&preview_mutex);
-    if (isRunning() && (previewFrames.size() < MAX_FRAME)) {
+    if (isRunning()) {
+        // A high-frame-rate Magewell/uncompressed source can outrun RGBX
+        // conversion for a short period. Keeping four old frames makes the
+        // preview visibly pause and then catch up. Drop the oldest queued
+        // frame instead so preview/record/RTMP always consume recent video.
+        if (previewFrames.size() >= MAX_FRAME) {
+            uvc_frame_t *stale = previewFrames.remove(0);
+            if (stale) recycle_frame(stale);
+        }
         previewFrames.put(frame);
         frame = NULL;
         pthread_cond_signal(&preview_sync);

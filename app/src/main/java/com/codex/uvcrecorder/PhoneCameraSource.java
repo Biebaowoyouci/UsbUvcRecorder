@@ -1,175 +1,563 @@
 package com.codex.uvcrecorder;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.content.Context;
 import android.content.pm.PackageManager;
+import android.graphics.ImageFormat;
+import android.graphics.Rect;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.OutputConfiguration;
-import android.hardware.camera2.params.SessionConfiguration;
+import android.media.Image;
+import android.media.ImageReader;
+import android.opengl.Matrix;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
-import android.util.Range;
+import android.os.SystemClock;
 import android.view.Surface;
 
 import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
 
-import com.serenegiant.usb.Size;
+import com.serenegiant.opengl.renderer.RendererHolder;
+import com.serenegiant.opengl.renderer.RendererHolderCallback;
 
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 
-/**
- * Camera2 input source. Sources that belong to the same logical multi-camera share one
- * CameraDevice and one capture session; each output is routed to its selected physical ID.
- */
+/** Camera2 input routed through the same GPU fan-out used by UVC and RTMP inputs. */
 final class PhoneCameraSource implements UvcSurfaceSource {
     interface Listener {
-        void onOpened(List<Size> modes);
+        void onConnecting(String detail);
 
-        void onPreviewConfigured(Size mode);
+        void onReady(int width, int height, int fps);
 
-        void onClosed();
-
-        void onError(Throwable error);
+        void onError(String message, Throwable error);
     }
 
-    interface PreviewCallback {
-        void onConfigured();
-
-        void onError(Throwable error);
-    }
-
-    private static final Object HUB_LOCK = new Object();
-    private static final Map<String, SharedCamera> HUBS = new LinkedHashMap<>();
+    private static final int SCREEN_SURFACE_ID = 0x43414D32;
+    private static final long FRAME_STALL_MS = 5_000L;
+    private static final long HEALTH_INTERVAL_MS = 2_000L;
+    private static final long REOPEN_DELAY_MS = 650L;
 
     private final Context context;
-    private final String logicalCameraId;
-    private final String physicalCameraId;
+    private final PhoneCameraCatalog.Device deviceInfo;
+    private final PhoneCameraCatalog.Mode mode;
     private final Listener listener;
+    private final CameraManager cameraManager;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final Set<Surface> recordingSurfaces = new LinkedHashSet<>();
-    private final Set<Surface> displaySurfaces = new LinkedHashSet<>();
-    private final SharedCamera hub;
+    private final HandlerThread cameraThread = new HandlerThread("phone-camera2-input");
+    private final Handler cameraHandler;
+    private final Map<Integer, int[]> recordingSurfaces = new HashMap<>();
+    private final AtomicInteger generation = new AtomicInteger();
+    private final int baseRotation;
+    private volatile PhoneCameraControls.State controls;
 
+    private volatile RendererHolder router;
+    private volatile ImageReader imageReader;
+    private volatile Yuv420SurfaceRenderer yuvRenderer;
+    private volatile CameraDevice cameraDevice;
+    private volatile CameraCaptureSession captureSession;
+    private volatile Surface screenSurface;
+    private volatile boolean screenSurfaceAttached;
+    private volatile Surface displaySurface;
     private volatile boolean released;
-    private volatile boolean registered;
-    private volatile Size selectedMode;
-    private volatile Surface previewSurface;
-    private volatile PreviewCallback pendingPreviewCallback;
+    private volatile long lastFrameAt;
+    private volatile long openStartedAt;
+    private int screenWidth;
+    private int screenHeight;
+    private int displaySurfaceId;
+    private int displayWidth;
+    private int displayHeight;
     private int outputRotation;
+    private boolean reopenScheduled;
+    private int reopenCount;
 
-    PhoneCameraSource(Context context, String logicalCameraId, Listener listener) {
-        this(context, logicalCameraId, null, listener);
-    }
-
-    PhoneCameraSource(Context context, String logicalCameraId, String physicalCameraId,
-                      Listener listener) {
-        this.context = context.getApplicationContext();
-        this.logicalCameraId = logicalCameraId;
-        this.physicalCameraId = physicalCameraId;
-        this.listener = listener;
-        synchronized (HUB_LOCK) {
-            SharedCamera existing = HUBS.get(logicalCameraId);
-            if (existing == null || existing.closed) {
-                existing = new SharedCamera(this.context, logicalCameraId);
-                HUBS.put(logicalCameraId, existing);
+    private final Runnable healthCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (released) return;
+            long reference = lastFrameAt > 0 ? lastFrameAt : openStartedAt;
+            long age = SystemClock.elapsedRealtime() - reference;
+            if (reference > 0 && age > FRAME_STALL_MS) {
+                scheduleReopen("手机摄像头画面中断，正在恢复", null);
+                return;
             }
-            hub = existing;
+            mainHandler.postDelayed(this, HEALTH_INTERVAL_MS);
         }
+    };
+
+    PhoneCameraSource(Context context, PhoneCameraCatalog.Device device,
+                      PhoneCameraCatalog.Mode mode, Listener listener) {
+        this.context = context.getApplicationContext();
+        this.deviceInfo = device;
+        this.mode = mode;
+        this.listener = listener;
+        cameraManager = (CameraManager) this.context.getSystemService(Context.CAMERA_SERVICE);
+        baseRotation = normalizedFrameRotation(deviceInfo.lensFacing);
+        controls = PhoneCameraControls.load(this.context, device);
+        cameraThread.start();
+        cameraHandler = new Handler(cameraThread.getLooper());
     }
 
     void start() {
-        if (released || registered) return;
-        registered = true;
-        hub.register(this);
+        if (released || router != null) return;
+        listener.onConnecting("正在打开 " + deviceInfo.label);
+        try {
+            router = new RendererHolder(mode.width, mode.height,
+                    new RendererHolderCallback() {
+                        @Override
+                        public void onPrimarySurfaceCreate(Surface surface) {
+                            mainHandler.post(PhoneCameraSource.this::attachPendingScreenSurface);
+                        }
+
+                        @Override
+                        public void onFrameAvailable() {
+                            long now = SystemClock.elapsedRealtime();
+                            boolean first = lastFrameAt <= 0;
+                            lastFrameAt = now;
+                            if (first) mainHandler.post(PhoneCameraSource.this::notifyReady);
+                        }
+
+                        @Override
+                        public void onPrimarySurfaceDestroy() {
+                        }
+                    });
+            router.setBeautyLevel(controls.beauty / 100f);
+            imageReader = ImageReader.newInstance(mode.width, mode.height,
+                    ImageFormat.YUV_420_888, 5);
+            imageReader.setOnImageAvailableListener(this::onImageAvailable, cameraHandler);
+            openCamera();
+            mainHandler.postDelayed(healthCheck, HEALTH_INTERVAL_MS);
+        } catch (Throwable error) {
+            listener.onError(readable(error), error);
+            scheduleReopen("手机摄像头初始化失败", error);
+        }
     }
 
-    boolean isOpened() {
-        return !released && hub.isOpened();
+    String cameraId() {
+        return deviceInfo.id;
     }
 
-    void startPreview(Size mode, Surface surface, PreviewCallback callback) {
-        if (released) {
-            callback.onError(new IllegalStateException("手机摄像头已释放"));
+    PhoneCameraCatalog.Mode selectedMode() {
+        return mode;
+    }
+
+    PhoneCameraControls.State controls() {
+        return controls.copy();
+    }
+
+    void updateControls(PhoneCameraControls.State next) {
+        PhoneCameraControls.State safe = PhoneCameraControls.clamp(deviceInfo, next);
+        controls = safe;
+        PhoneCameraControls.save(context, deviceInfo, safe);
+        RendererHolder holder = router;
+        if (holder != null) holder.setBeautyLevel(safe.beauty / 100f);
+        cameraHandler.post(() -> {
+            try {
+                submitRepeatingRequest();
+            } catch (Throwable error) {
+                mainHandler.post(() -> listener.onError(
+                        "相机控制无法应用：" + readable(error), error));
+            }
+        });
+        applyAllTransforms();
+    }
+
+    void triggerAutoFocus() {
+        cameraHandler.post(() -> {
+            CameraDevice camera = cameraDevice;
+            CameraCaptureSession session = captureSession;
+            ImageReader reader = imageReader;
+            if (camera == null || session == null || reader == null) return;
+            try {
+                CaptureRequest.Builder request =
+                        camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
+                request.addTarget(reader.getSurface());
+                applyCaptureControls(request, controls);
+                request.set(CaptureRequest.CONTROL_AF_MODE,
+                        CaptureRequest.CONTROL_AF_MODE_AUTO);
+                request.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                        CaptureRequest.CONTROL_AF_TRIGGER_START);
+                session.capture(request.build(), new CameraCaptureSession.CaptureCallback() {
+                    @Override
+                    public void onCaptureCompleted(@NonNull CameraCaptureSession captureSession,
+                                                   @NonNull CaptureRequest captureRequest,
+                                                   @NonNull TotalCaptureResult result) {
+                        cameraHandler.postDelayed(() -> {
+                            try {
+                                submitRepeatingRequest();
+                            } catch (Throwable ignored) {
+                            }
+                        }, 160L);
+                    }
+                }, cameraHandler);
+            } catch (Throwable error) {
+                mainHandler.post(() -> listener.onError("单次对焦失败", error));
+            }
+        });
+    }
+
+    private void onImageAvailable(ImageReader reader) {
+        Image image = null;
+        try {
+            // Never encode/render stale camera frames. If the GPU is briefly
+            // busy, acquireLatestImage closes the queued older images so
+            // preview, recording and RTMP latency cannot grow over time.
+            image = reader.acquireLatestImage();
+            if (image == null || released) return;
+            Yuv420SurfaceRenderer renderer = yuvRenderer;
+            if (renderer == null) return;
+            boolean frontCamera =
+                    deviceInfo.lensFacing == CameraCharacteristics.LENS_FACING_FRONT;
+            int frameRotation = frontCamera
+                    ? (baseRotation + 180) % 360 : baseRotation;
+            renderer.render(image, frameRotation, frontCamera);
+            long now = SystemClock.elapsedRealtime();
+            boolean first = lastFrameAt <= 0;
+            lastFrameAt = now;
+            if (first) mainHandler.post(this::notifyReady);
+        } catch (IllegalStateException error) {
+            scheduleReopen("手机摄像头图像队列异常，正在恢复", error);
+        } catch (Throwable error) {
+            scheduleReopen("手机摄像头 YUV 渲染异常，正在恢复", error);
+        } finally {
+            if (image != null) {
+                try {
+                    image.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private void openCamera() {
+        if (released || cameraManager == null || router == null) return;
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            listener.onError("未授予手机摄像头权限", null);
             return;
         }
-        selectedMode = mode.clone();
-        previewSurface = surface;
-        pendingPreviewCallback = callback;
-        hub.reconfigure(this, null);
+        final int openGeneration = generation.incrementAndGet();
+        lastFrameAt = 0;
+        openStartedAt = SystemClock.elapsedRealtime();
+        cameraHandler.post(() -> {
+            if (released || openGeneration != generation.get()) return;
+            closeCameraOnly();
+            try {
+                cameraManager.openCamera(deviceInfo.openId, new CameraDevice.StateCallback() {
+                    @Override
+                    public void onOpened(@NonNull CameraDevice camera) {
+                        if (released || openGeneration != generation.get()) {
+                            camera.close();
+                            return;
+                        }
+                        cameraDevice = camera;
+                        createSession(camera, openGeneration);
+                    }
+
+                    @Override
+                    public void onDisconnected(@NonNull CameraDevice camera) {
+                        camera.close();
+                        if (cameraDevice == camera) cameraDevice = null;
+                        scheduleReopen("手机摄像头暂时断开", null);
+                    }
+
+                    @Override
+                    public void onError(@NonNull CameraDevice camera, int error) {
+                        camera.close();
+                        if (cameraDevice == camera) cameraDevice = null;
+                        scheduleReopen("手机摄像头错误 " + error, null);
+                    }
+                }, cameraHandler);
+            } catch (Throwable error) {
+                scheduleReopen("无法打开手机摄像头", error);
+            }
+        });
+    }
+
+    private void createSession(CameraDevice camera, int openGeneration) {
+        RendererHolder holder = router;
+        ImageReader reader = imageReader;
+        if (released || holder == null || reader == null) return;
+        if (!holder.isRunning()) {
+            cameraHandler.postDelayed(() -> {
+                if (!released && openGeneration == generation.get()
+                        && cameraDevice == camera) {
+                    createSession(camera, openGeneration);
+                }
+            }, 50L);
+            return;
+        }
+        try {
+            if (yuvRenderer == null) {
+                yuvRenderer = new Yuv420SurfaceRenderer(
+                        holder.getPrimarySurface(), mode.width, mode.height);
+            }
+            Surface input = reader.getSurface();
+            CameraCaptureSession.StateCallback callback =
+                    new CameraCaptureSession.StateCallback() {
+                        @Override
+                        public void onConfigured(@NonNull CameraCaptureSession session) {
+                            if (released || openGeneration != generation.get()
+                                    || cameraDevice != camera) {
+                                session.close();
+                                return;
+                            }
+                            captureSession = session;
+                            try {
+                                submitRepeatingRequest();
+                                reopenScheduled = false;
+                            } catch (Throwable error) {
+                                scheduleReopen("手机摄像头无法开始预览", error);
+                            }
+                        }
+
+                        @Override
+                        public void onConfigureFailed(@NonNull CameraCaptureSession session) {
+                            session.close();
+                            scheduleReopen("手机摄像头不支持所选模式", null);
+                        }
+                    };
+            if (Build.VERSION.SDK_INT >= 28
+                    && deviceInfo.physicalId != null && !deviceInfo.physicalId.isEmpty()) {
+                OutputConfiguration output = new OutputConfiguration(input);
+                output.setPhysicalCameraId(deviceInfo.physicalId);
+                List<OutputConfiguration> outputs = Collections.singletonList(output);
+                camera.createCaptureSessionByOutputConfigurations(
+                        outputs, callback, cameraHandler);
+            } else {
+                camera.createCaptureSession(Collections.singletonList(input),
+                        callback, cameraHandler);
+            }
+        } catch (Throwable error) {
+            scheduleReopen("手机摄像头会话创建失败", error);
+        }
+    }
+
+    private void submitRepeatingRequest() throws Exception {
+        CameraDevice camera = cameraDevice;
+        CameraCaptureSession session = captureSession;
+        ImageReader reader = imageReader;
+        if (released || camera == null || session == null || reader == null) {
+            return;
+        }
+        CaptureRequest.Builder request =
+                camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
+        request.addTarget(reader.getSurface());
+        applyCaptureControls(request, controls);
+        session.setRepeatingRequest(request.build(), null, cameraHandler);
+    }
+
+    private void applyCaptureControls(CaptureRequest.Builder request,
+                                      PhoneCameraControls.State state) {
+        PhoneCameraCatalog.Capabilities capabilities = deviceInfo.capabilities;
+        PhoneCameraControls.State safe = PhoneCameraControls.clamp(deviceInfo, state);
+        request.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO);
+        if (mode.aeRange != null) {
+            request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, mode.aeRange);
+        }
+        request.set(CaptureRequest.CONTROL_AWB_MODE, safe.awbMode);
+        request.set(CaptureRequest.CONTROL_AF_MODE, safe.afMode);
+        if (safe.afMode == CaptureRequest.CONTROL_AF_MODE_OFF
+                && capabilities.minimumFocusDistance > 0f) {
+            request.set(CaptureRequest.LENS_FOCUS_DISTANCE, safe.focusDistance);
+        }
+        if (safe.autoExposure || !capabilities.supportsManualExposure()) {
+            request.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+            request.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                    safe.exposureCompensation);
+        } else {
+            request.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+            request.set(CaptureRequest.SENSOR_SENSITIVITY, safe.iso);
+            request.set(CaptureRequest.SENSOR_EXPOSURE_TIME, safe.exposureTimeNs);
+            long frameDuration = Math.max(safe.exposureTimeNs,
+                    1_000_000_000L / Math.max(1, mode.fps));
+            request.set(CaptureRequest.SENSOR_FRAME_DURATION, frameDuration);
+        }
+        applyZoom(request, safe.zoomRatio, capabilities);
+        if (safe.beauty > 0) {
+            if (contains(capabilities.noiseReductionModes,
+                    CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)) {
+                request.set(CaptureRequest.NOISE_REDUCTION_MODE,
+                        CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY);
+            }
+            if (contains(capabilities.edgeModes, CaptureRequest.EDGE_MODE_OFF)) {
+                request.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF);
+            }
+        }
+    }
+
+    private static void applyZoom(CaptureRequest.Builder request, float ratio,
+                                  PhoneCameraCatalog.Capabilities capabilities) {
+        if (Build.VERSION.SDK_INT >= 30 && capabilities.zoomRatioRange != null) {
+            request.set(CaptureRequest.CONTROL_ZOOM_RATIO, ratio);
+            return;
+        }
+        Rect active = capabilities.activeArray;
+        if (active == null || ratio <= 1f) return;
+        int cropWidth = Math.max(2, Math.round(active.width() / ratio));
+        int cropHeight = Math.max(2, Math.round(active.height() / ratio));
+        int left = active.centerX() - cropWidth / 2;
+        int top = active.centerY() - cropHeight / 2;
+        request.set(CaptureRequest.SCALER_CROP_REGION,
+                new Rect(left, top, left + cropWidth, top + cropHeight));
+    }
+
+    private void scheduleReopen(String message, Throwable error) {
+        mainHandler.post(() -> {
+            if (released || reopenScheduled) return;
+            reopenScheduled = true;
+            reopenCount++;
+            listener.onConnecting(message + "（第 " + reopenCount + " 次）");
+            if (error != null) listener.onError(message + "：" + readable(error), error);
+            mainHandler.removeCallbacks(healthCheck);
+            mainHandler.postDelayed(() -> {
+                if (released) return;
+                reopenScheduled = false;
+                openCamera();
+                mainHandler.postDelayed(healthCheck, HEALTH_INTERVAL_MS);
+            }, REOPEN_DELAY_MS);
+        });
+    }
+
+    private void notifyReady() {
+        if (released) return;
+        reopenCount = 0;
+        attachPendingScreenSurface();
+        applyAllTransforms();
+        listener.onReady(mode.width, mode.height, mode.fps);
     }
 
     @Override
-    public void addRecordingSurface(Surface surface) throws Exception {
-        changeSurface(surface, true, true);
+    public PcmAudioSubscription subscribeAudio(Context ignored) throws Exception {
+        return PhoneAudioHub.subscribe(context);
+    }
+
+    @Override
+    public void addRecordingSurface(Surface surface) {
+        addRecordingSurface(surface, getRecordingWidth(orientedWidth(), orientedHeight()),
+                getRecordingHeight(orientedWidth(), orientedHeight()));
+    }
+
+    @Override
+    public void addRecordingSurface(Surface surface, int width, int height) {
+        RendererHolder holder = requireRouter(surface);
+        int id = surface.hashCode();
+        holder.addSlaveSurface(id, surface, true);
+        synchronized (recordingSurfaces) {
+            recordingSurfaces.put(id, new int[]{width, height});
+        }
+        applyTransform(holder, id, width, height);
     }
 
     @Override
     public void removeRecordingSurface(Surface surface) {
-        try {
-            changeSurface(surface, false, true);
-        } catch (Exception ignored) {
+        if (surface == null) return;
+        int id = surface.hashCode();
+        synchronized (recordingSurfaces) {
+            recordingSurfaces.remove(id);
+        }
+        RendererHolder holder = router;
+        if (holder != null) {
+            try {
+                holder.removeSlaveSurface(id);
+            } catch (Throwable ignored) {
+            }
         }
     }
 
     @Override
-    public void addDisplaySurface(Surface surface, int width, int height) throws Exception {
-        changeSurface(surface, true, false);
+    public void setScreenSurface(Surface surface, int width, int height) {
+        screenWidth = width;
+        screenHeight = height;
+        RendererHolder holder = router;
+        if (screenSurface != surface || surface == null) {
+            Surface previous = screenSurface;
+            screenSurface = surface;
+            boolean wasAttached = screenSurfaceAttached;
+            screenSurfaceAttached = false;
+            if (holder != null && wasAttached && previous != null) {
+                try {
+                    holder.removeSlaveSurface(SCREEN_SURFACE_ID);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        attachPendingScreenSurface();
+    }
+
+    private void attachPendingScreenSurface() {
+        if (released) return;
+        RendererHolder holder = router;
+        Surface desired = screenSurface;
+        if (holder == null || !holder.isRunning() || desired == null
+                || !desired.isValid() || screenSurfaceAttached) {
+            return;
+        }
+        try {
+            try {
+                holder.removeSlaveSurface(SCREEN_SURFACE_ID);
+            } catch (Throwable ignored) {
+            }
+            holder.addSlaveSurface(SCREEN_SURFACE_ID, desired, false);
+            screenSurfaceAttached = true;
+            applyTransform(holder, SCREEN_SURFACE_ID, screenWidth, screenHeight);
+        } catch (Throwable error) {
+            screenSurfaceAttached = false;
+            mainHandler.postDelayed(this::attachPendingScreenSurface, 120L);
+        }
+    }
+
+    @Override
+    public void addDisplaySurface(Surface surface, int width, int height) {
+        RendererHolder holder = requireRouter(surface);
+        removeDisplaySurface(displaySurface);
+        int id = surface.hashCode() ^ 0x48444D49;
+        holder.addSlaveSurface(id, surface, false);
+        displaySurface = surface;
+        displaySurfaceId = id;
+        displayWidth = width;
+        displayHeight = height;
+        applyTransform(holder, id, width, height);
     }
 
     @Override
     public void removeDisplaySurface(Surface surface) {
-        try {
-            changeSurface(surface, false, false);
-        } catch (Exception ignored) {
+        if (displaySurface == null || (surface != null && surface != displaySurface)) return;
+        RendererHolder holder = router;
+        int id = displaySurfaceId;
+        displaySurface = null;
+        displaySurfaceId = 0;
+        displayWidth = 0;
+        displayHeight = 0;
+        if (holder != null && id != 0) {
+            try {
+                holder.removeSlaveSurface(id);
+            } catch (Throwable ignored) {
+            }
         }
-    }
-
-    private void changeSurface(Surface surface, boolean add, boolean recording) throws Exception {
-        if (surface == null || released) return;
-        CountDownLatch latch = new CountDownLatch(1);
-        AtomicReference<Throwable> failure = new AtomicReference<>();
-        hub.handler.post(() -> {
-            Set<Surface> targets = recording ? recordingSurfaces : displaySurfaces;
-            if (add) targets.add(surface); else targets.remove(surface);
-            hub.configure(this, new Completion() {
-                @Override
-                public void complete(Throwable error) {
-                    failure.set(error);
-                    latch.countDown();
-                }
-            });
-        });
-        if (!latch.await(7, TimeUnit.SECONDS)) {
-            throw new IllegalStateException("手机摄像头切换录制 Surface 超时");
-        }
-        if (failure.get() != null) throw new Exception(failure.get());
-    }
-
-    @Override
-    public PcmAudioSubscription subscribeAudio(Context context) throws Exception {
-        return MicrophoneAudioHub.subscribe(context);
     }
 
     @Override
     public void setOutputRotation(int degrees) {
-        outputRotation = ((degrees % 360) + 360) % 360;
+        int normalized = Math.floorMod(degrees, 360);
+        if (normalized % 90 != 0) {
+            throw new IllegalArgumentException("旋转角度必须是 90° 的倍数");
+        }
+        outputRotation = normalized;
+        applyAllTransforms();
     }
 
     @Override
@@ -177,364 +565,147 @@ final class PhoneCameraSource implements UvcSurfaceSource {
         return outputRotation;
     }
 
-    @Override
-    public int getRecordingWidth(int inputWidth, int inputHeight) {
-        return inputWidth;
+    private RendererHolder requireRouter(Surface surface) {
+        if (surface == null || !surface.isValid()) {
+            throw new IllegalArgumentException("输出 Surface 无效");
+        }
+        RendererHolder holder = router;
+        if (released || holder == null || !holder.isRunning()) {
+            throw new IllegalStateException("手机摄像头画面尚未就绪");
+        }
+        return holder;
     }
 
-    @Override
-    public int getRecordingHeight(int inputWidth, int inputHeight) {
-        return inputHeight;
+    private void applyAllTransforms() {
+        RendererHolder holder = router;
+        if (holder == null || !holder.isRunning()) return;
+        if (screenSurface != null) {
+            attachPendingScreenSurface();
+            if (screenSurfaceAttached) {
+                applyTransform(holder, SCREEN_SURFACE_ID, screenWidth, screenHeight);
+            }
+        }
+        if (displaySurface != null && displaySurfaceId != 0) {
+            applyTransform(holder, displaySurfaceId, displayWidth, displayHeight);
+        }
+        synchronized (recordingSurfaces) {
+            for (Map.Entry<Integer, int[]> entry : recordingSurfaces.entrySet()) {
+                int[] size = entry.getValue();
+                applyTransform(holder, entry.getKey(), size[0], size[1]);
+            }
+        }
+    }
+
+    private void applyTransform(RendererHolder holder, int id, int targetWidth,
+                                int targetHeight) {
+        if (targetWidth <= 0 || targetHeight <= 0) return;
+        int rotation = Math.floorMod(outputRotation, 360);
+        float[] scale = controls.scaleMode == PhoneCameraControls.SCALE_FIT
+                ? VideoLayout.fitCenterScale(mode.width, mode.height,
+                rotation, targetWidth, targetHeight)
+                : VideoLayout.centerCropScale(mode.width, mode.height,
+                rotation, targetWidth, targetHeight);
+        float[] matrix = new float[16];
+        Matrix.setIdentityM(matrix, 0);
+        Matrix.scaleM(matrix, 0, scale[0], scale[1], 1f);
+        Matrix.rotateM(matrix, 0, rotation, 0f, 0f, -1f);
+        try {
+            holder.setSlaveMvpMatrix(id, matrix);
+        } catch (Throwable ignored) {
+        }
     }
 
     void release() {
         if (released) return;
         released = true;
-        pendingPreviewCallback = null;
-        hub.unregister(this);
-    }
-
-    private void postModes(List<Size> modes) {
-        mainHandler.post(() -> {
-            if (!released) listener.onOpened(modes);
-        });
-    }
-
-    private void postConfigured() {
-        PreviewCallback callback = pendingPreviewCallback;
-        pendingPreviewCallback = null;
-        Size mode = selectedMode == null ? null : selectedMode.clone();
-        mainHandler.post(() -> {
-            if (released) return;
-            if (callback != null) callback.onConfigured();
-            if (mode != null) listener.onPreviewConfigured(mode);
-        });
-    }
-
-    private void postError(Throwable error) {
-        PreviewCallback callback = pendingPreviewCallback;
-        pendingPreviewCallback = null;
-        mainHandler.post(() -> {
-            if (released) return;
-            if (callback != null) callback.onError(error);
-            listener.onError(error);
-        });
-    }
-
-    private void postClosed() {
-        mainHandler.post(() -> {
-            if (!released) listener.onClosed();
-        });
-    }
-
-    private interface Completion {
-        void complete(Throwable error);
-    }
-
-    private static final class SharedCamera {
-        final Context context;
-        final String logicalCameraId;
-        final CameraManager manager;
-        final HandlerThread thread;
-        final Handler handler;
-        final Set<PhoneCameraSource> clients = new LinkedHashSet<>();
-        final List<Completion> pendingCompletions = new ArrayList<>();
-        CameraCharacteristics characteristics;
-        CameraDevice device;
-        CameraCaptureSession session;
-        int generation;
-        boolean opening;
-        volatile boolean closed;
-
-        SharedCamera(Context context, String logicalCameraId) {
-            this.context = context;
-            this.logicalCameraId = logicalCameraId;
-            manager = (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
-            thread = new HandlerThread("phone-logical-camera-" + logicalCameraId);
-            thread.start();
-            handler = new Handler(thread.getLooper());
-        }
-
-        boolean isOpened() {
-            return device != null && !closed;
-        }
-
-        void register(PhoneCameraSource source) {
-            handler.post(() -> {
-                if (closed || source.released) return;
-                clients.add(source);
+        generation.incrementAndGet();
+        mainHandler.removeCallbacksAndMessages(null);
+        cameraHandler.post(() -> {
+            closeCameraOnly();
+            Yuv420SurfaceRenderer renderer = yuvRenderer;
+            yuvRenderer = null;
+            if (renderer != null) {
                 try {
-                    List<Size> modes = PhoneCameraCatalog.modes(context,
-                            source.logicalCameraId, source.physicalCameraId);
-                    source.postModes(modes);
-                } catch (Throwable error) {
-                    source.postError(error);
+                    renderer.release();
+                } catch (Throwable ignored) {
                 }
-            });
-        }
-
-        void unregister(PhoneCameraSource source) {
-            handler.post(() -> {
-                clients.remove(source);
-                source.recordingSurfaces.clear();
-                source.displaySurfaces.clear();
-                source.previewSurface = null;
-                if (clients.isEmpty()) {
-                    closeLocked();
-                    synchronized (HUB_LOCK) {
-                        if (HUBS.get(logicalCameraId) == this) HUBS.remove(logicalCameraId);
-                    }
-                } else {
-                    configure(null, null);
+            }
+            ImageReader reader = imageReader;
+            imageReader = null;
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (Throwable ignored) {
                 }
-            });
-        }
+            }
+            RendererHolder holder = router;
+            router = null;
+            if (holder != null) {
+                try {
+                    holder.release();
+                } catch (Throwable ignored) {
+                }
+            }
+            synchronized (recordingSurfaces) {
+                recordingSurfaces.clear();
+            }
+            screenSurfaceAttached = false;
+            cameraThread.quitSafely();
+        });
+    }
 
-        void reconfigure(PhoneCameraSource requester, Completion completion) {
-            handler.post(() -> configure(requester, completion));
-        }
-
-        void configure(PhoneCameraSource requester, Completion completion) {
-            if (completion != null) pendingCompletions.add(completion);
-            if (closed) {
-                failAll(new IllegalStateException("逻辑摄像头会话已关闭"));
-                return;
-            }
-            if (!hasValidPreview()) {
-                completeAll(null);
-                return;
-            }
-            if (device == null) {
-                openLocked();
-                return;
-            }
-            createSessionLocked();
-        }
-
-        private boolean hasValidPreview() {
-            for (PhoneCameraSource source : clients) {
-                if (!source.released && source.previewSurface != null
-                        && source.previewSurface.isValid()) return true;
-            }
-            return false;
-        }
-
-        private void openLocked() {
-            if (opening || device != null) return;
-            if (manager == null) {
-                failAll(new IllegalStateException("CameraManager 不可用"));
-                return;
-            }
-            if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
-                    != PackageManager.PERMISSION_GRANTED) {
-                failAll(new SecurityException("未授予手机摄像头权限"));
-                return;
-            }
-            opening = true;
+    private void closeCameraOnly() {
+        CameraCaptureSession session = captureSession;
+        captureSession = null;
+        if (session != null) {
             try {
-                characteristics = manager.getCameraCharacteristics(logicalCameraId);
-                manager.openCamera(logicalCameraId, new CameraDevice.StateCallback() {
-                    @Override
-                    public void onOpened(@NonNull CameraDevice camera) {
-                        opening = false;
-                        if (closed) {
-                            camera.close();
-                            return;
-                        }
-                        device = camera;
-                        createSessionLocked();
-                    }
-
-                    @Override
-                    public void onDisconnected(@NonNull CameraDevice camera) {
-                        opening = false;
-                        camera.close();
-                        if (device == camera) device = null;
-                        for (PhoneCameraSource source : new ArrayList<>(clients)) {
-                            source.postClosed();
-                        }
-                        failAll(new IllegalStateException("手机逻辑摄像头已断开"));
-                    }
-
-                    @Override
-                    public void onError(@NonNull CameraDevice camera, int error) {
-                        opening = false;
-                        camera.close();
-                        if (device == camera) device = null;
-                        failAll(new IllegalStateException(
-                                cameraErrorMessage(error) + "（逻辑 Camera "
-                                        + logicalCameraId + "）"));
-                    }
-                }, handler);
-            } catch (Throwable error) {
-                opening = false;
-                failAll(error);
+                session.stopRepeating();
+            } catch (Throwable ignored) {
             }
-        }
-
-        private void createSessionLocked() {
-            CameraDevice camera = device;
-            if (camera == null || closed) return;
-            int request = ++generation;
-            if (session != null) {
-                session.close();
-                session = null;
-            }
-            List<OutputConfiguration> configurations = new ArrayList<>();
-            List<Surface> targets = new ArrayList<>();
-            boolean recording = false;
             try {
-                for (PhoneCameraSource source : clients) {
-                    if (source.released) continue;
-                    addOutput(configurations, targets, source.previewSurface,
-                            source.physicalCameraId);
-                    for (Surface surface : source.recordingSurfaces) {
-                        addOutput(configurations, targets, surface, source.physicalCameraId);
-                        recording = true;
-                    }
-                    for (Surface surface : source.displaySurfaces) {
-                        addOutput(configurations, targets, surface, source.physicalCameraId);
-                    }
-                }
-                if (targets.isEmpty()) {
-                    completeAll(null);
-                    return;
-                }
-                boolean recordTemplate = recording;
-                CameraCaptureSession.StateCallback callback =
-                        new CameraCaptureSession.StateCallback() {
-                    @Override
-                    public void onConfigured(@NonNull CameraCaptureSession configured) {
-                        if (closed || request != generation || device != camera) {
-                            configured.close();
-                            return;
-                        }
-                        session = configured;
-                        try {
-                            CaptureRequest.Builder builder = camera.createCaptureRequest(
-                                    recordTemplate ? CameraDevice.TEMPLATE_RECORD
-                                            : CameraDevice.TEMPLATE_PREVIEW);
-                            for (Surface target : targets) builder.addTarget(target);
-                            builder.set(CaptureRequest.CONTROL_MODE,
-                                    CaptureRequest.CONTROL_MODE_AUTO);
-                            Range<Integer> fps = selectFpsRange(maxRequestedFps());
-                            if (fps != null) {
-                                builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps);
-                            }
-                            configured.setRepeatingRequest(builder.build(), null, handler);
-                            for (PhoneCameraSource source : clients) {
-                                if (source.previewSurface != null
-                                        && source.previewSurface.isValid()) {
-                                    source.postConfigured();
-                                }
-                            }
-                            completeAll(null);
-                        } catch (Throwable error) {
-                            failAll(error);
-                        }
-                    }
-
-                    @Override
-                    public void onConfigureFailed(@NonNull CameraCaptureSession failed) {
-                        failAll(new IllegalStateException(
-                                "手机不支持当前物理镜头并发组合或输出数量"));
-                    }
-                };
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    Executor executor = command -> handler.post(command);
-                    SessionConfiguration configuration = new SessionConfiguration(
-                            SessionConfiguration.SESSION_REGULAR, configurations,
-                            executor, callback);
-                    camera.createCaptureSession(configuration);
-                } else {
-                    camera.createCaptureSession(targets, callback, handler);
-                }
-            } catch (Throwable error) {
-                failAll(error);
-            }
-        }
-
-        private void addOutput(List<OutputConfiguration> configurations,
-                               List<Surface> targets, Surface surface,
-                               String physicalCameraId) {
-            if (surface == null || !surface.isValid()) return;
-            targets.add(surface);
-            OutputConfiguration output = new OutputConfiguration(surface);
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-                    && physicalCameraId != null && !physicalCameraId.isEmpty()) {
-                output.setPhysicalCameraId(physicalCameraId);
-            }
-            configurations.add(output);
-        }
-
-        private int maxRequestedFps() {
-            int result = 30;
-            for (PhoneCameraSource source : clients) {
-                if (source.selectedMode != null) {
-                    result = Math.max(result, source.selectedMode.fps);
-                }
-            }
-            return result;
-        }
-
-        @SuppressWarnings("unchecked")
-        private Range<Integer> selectFpsRange(int requested) {
-            if (characteristics == null) return null;
-            Range<Integer>[] ranges = characteristics.get(
-                    CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
-            if (ranges == null || ranges.length == 0) return null;
-            Range<Integer> best = ranges[0];
-            int scoreBest = Integer.MAX_VALUE;
-            for (Range<Integer> range : ranges) {
-                int score = Math.abs(range.getUpper() - requested) * 10
-                        + Math.abs(range.getLower() - requested);
-                if (range.contains(requested)) score -= 1000;
-                if (score < scoreBest) {
-                    best = range;
-                    scoreBest = score;
-                }
-            }
-            return best;
-        }
-
-        private void completeAll(Throwable error) {
-            for (Completion completion : new ArrayList<>(pendingCompletions)) {
-                completion.complete(error);
-            }
-            pendingCompletions.clear();
-        }
-
-        private void failAll(Throwable error) {
-            completeAll(error);
-            for (PhoneCameraSource source : new ArrayList<>(clients)) {
-                source.postError(error);
-            }
-        }
-
-        private void closeLocked() {
-            closed = true;
-            generation++;
-            completeAll(new IllegalStateException("手机摄像头会话已关闭"));
-            if (session != null) {
                 session.close();
-                session = null;
+            } catch (Throwable ignored) {
             }
-            if (device != null) {
-                device.close();
-                device = null;
-            }
-            thread.quitSafely();
         }
+        CameraDevice camera = cameraDevice;
+        cameraDevice = null;
+        if (camera != null) {
+            try {
+                camera.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
 
-        private static String cameraErrorMessage(int error) {
-            if (error == CameraDevice.StateCallback.ERROR_CAMERA_IN_USE) return "摄像头已被占用";
-            if (error == CameraDevice.StateCallback.ERROR_MAX_CAMERAS_IN_USE) {
-                return "手机已达到可同时开启的摄像头数量上限";
-            }
-            if (error == CameraDevice.StateCallback.ERROR_CAMERA_DISABLED) return "摄像头被系统禁用";
-            if (error == CameraDevice.StateCallback.ERROR_CAMERA_DEVICE) return "摄像头设备错误";
-            if (error == CameraDevice.StateCallback.ERROR_CAMERA_SERVICE) return "摄像头服务错误";
-            return "Camera2 打开失败，错误码 " + error;
+    private int orientedWidth() {
+        return mode.width;
+    }
+
+    private int orientedHeight() {
+        return mode.height;
+    }
+
+    /**
+     * Normalizes the sensor once, independently of the Activity/display
+     * orientation. Gyroscope-driven UI rotation must never alter preview,
+     * recording, RTMP or HDMI pixels; only setOutputRotation may do that.
+     */
+    static int normalizedFrameRotation(int lensFacing) {
+        return lensFacing == CameraCharacteristics.LENS_FACING_FRONT ? 180 : 0;
+    }
+
+    private static String readable(Throwable error) {
+        if (error == null) return "未知错误";
+        String message = error.getMessage();
+        return message == null || message.trim().isEmpty()
+                ? error.getClass().getSimpleName() : message;
+    }
+
+    private static boolean contains(int[] values, int target) {
+        if (values == null) return false;
+        for (int value : values) {
+            if (value == target) return true;
         }
+        return false;
     }
 }

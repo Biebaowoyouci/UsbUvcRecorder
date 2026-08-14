@@ -11,6 +11,7 @@ import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.media.MediaPlayer;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -487,6 +488,10 @@ final class HdmiOutputController implements DisplayManager.DisplayListener {
 
         private void routeFileAudio(MediaPlayer mediaPlayer, boolean warnOnFailure) {
             if (hdmiAudioDevice == null) return;
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                Log.i(TAG, "MediaPlayer preferred HDMI routing requires Android 9 or newer");
+                return;
+            }
             boolean accepted = mediaPlayer.setPreferredDevice(hdmiAudioDevice);
             AudioDeviceInfo routed = mediaPlayer.getRoutedDevice();
             boolean correct = routed == null || routed.getId() == hdmiAudioDevice.getId();

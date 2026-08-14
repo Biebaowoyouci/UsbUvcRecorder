@@ -26,6 +26,7 @@ import com.serenegiant.uvccamera.BuildConfig;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -49,6 +50,7 @@ public class RendererHolder extends EGLTask implements IRendererHolder {
     protected static final int REQUEST_CLEAR_SLAVE_SURFACE_ALL = 12;
     protected static final int REQUEST_REMOVE_SLAVE_SURFACE_ALL = 13;
     protected static final int REQUEST_RELEASE_PRIMARY_SURFACE = 14;
+    protected static final int REQUEST_SET_BEAUTY = 15;
     protected static final int REQUEST_RELEASE = 99;
 
     protected final Context mContext = UVCUtils.getApplication();
@@ -75,6 +77,7 @@ public class RendererHolder extends EGLTask implements IRendererHolder {
     private final Condition mCreatePrimarySurfaceCondition = mLock.newCondition();
 
     private int mMirrorMode = MirrorMode.MIRROR_NORMAL;
+    private float mBeautyLevel;
     private volatile boolean mIsFirstFrameRendered;
 
     protected final RendererHandler mRendererHandler;
@@ -383,6 +386,17 @@ public class RendererHolder extends EGLTask implements IRendererHolder {
         mRendererHandler.sendEmptyMessage(REQUEST_DRAW);
     }
 
+    /**
+     * Applies lightweight GPU skin smoothing to preview, recording and streaming outputs.
+     * The shader change runs on the EGL thread and never interrupts the Camera2 session.
+     */
+    public void setBeautyLevel(float level) {
+        float safe = Math.max(0f, Math.min(1f, level));
+        mRendererHandler.removeMessages(REQUEST_SET_BEAUTY);
+        mRendererHandler.sendMessage(
+                mRendererHandler.obtainMessage(REQUEST_SET_BEAUTY, Float.valueOf(safe)));
+    }
+
     //--------------------------------------------------------------------------------
 
     /**
@@ -470,6 +484,9 @@ public class RendererHolder extends EGLTask implements IRendererHolder {
                     break;
                 case REQUEST_RELEASE_PRIMARY_SURFACE:
                     handleReleasePrimarySurface();
+                    break;
+                case REQUEST_SET_BEAUTY:
+                    handleSetBeauty((Float) msg.obj);
                     break;
                 case REQUEST_RELEASE:
                     handleRelease();
@@ -741,6 +758,19 @@ public class RendererHolder extends EGLTask implements IRendererHolder {
             makeCurrent();
         }
 
+        private void handleSetBeauty(float level) {
+            float quantized = Math.round(level * 20f) / 20f;
+            if (mDrawer == null || Math.abs(quantized - mBeautyLevel) < 0.001f) return;
+            makeCurrent();
+            mBeautyLevel = quantized;
+            if (quantized <= 0f) {
+                mDrawer.resetShader();
+            } else {
+                mDrawer.updateShader(createBeautyShader(
+                        Math.max(1, mVideoWidth), Math.max(1, mVideoHeight), quantized));
+            }
+        }
+
         /**
          * The callback listener when receiving video data on SurfaceTexture
          */
@@ -781,5 +811,32 @@ public class RendererHolder extends EGLTask implements IRendererHolder {
             default:
                 break;
         }
+    }
+
+    private static String createBeautyShader(int width, int height, float level) {
+        return String.format(Locale.US,
+                "#version 100\n"
+                        + "#extension GL_OES_EGL_image_external : require\n"
+                        + "precision highp float;\n"
+                        + "uniform samplerExternalOES sTexture;\n"
+                        + "varying highp vec2 vTextureCoord;\n"
+                        + "void main() {\n"
+                        + "  vec2 d = vec2(%.9f, %.9f) * 2.0;\n"
+                        + "  vec4 c = texture2D(sTexture, vTextureCoord);\n"
+                        + "  vec3 b = c.rgb * 4.0;\n"
+                        + "  b += texture2D(sTexture, vTextureCoord + vec2(d.x, 0.0)).rgb;\n"
+                        + "  b += texture2D(sTexture, vTextureCoord - vec2(d.x, 0.0)).rgb;\n"
+                        + "  b += texture2D(sTexture, vTextureCoord + vec2(0.0, d.y)).rgb;\n"
+                        + "  b += texture2D(sTexture, vTextureCoord - vec2(0.0, d.y)).rgb;\n"
+                        + "  b *= 0.125;\n"
+                        + "  float warm = clamp((c.r - c.b) * 3.0, 0.0, 1.0);\n"
+                        + "  float skin = warm * (1.0 - smoothstep(0.18, 0.65,"
+                        + " max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b))));\n"
+                        + "  float strength = %.4f * (0.22 + 0.58 * skin);\n"
+                        + "  vec3 smooth = mix(c.rgb, b, strength);\n"
+                        + "  smooth += vec3(%.4f) * skin;\n"
+                        + "  gl_FragColor = vec4(clamp(smooth, 0.0, 1.0), c.a);\n"
+                        + "}\n",
+                1f / width, 1f / height, level, level * 0.025f);
     }
 }

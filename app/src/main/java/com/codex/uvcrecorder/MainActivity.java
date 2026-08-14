@@ -3,8 +3,10 @@ package com.codex.uvcrecorder;
 import android.Manifest;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.SurfaceTexture;
+import android.hardware.display.DisplayManager;
 import android.hardware.usb.UsbDevice;
 import android.net.Uri;
 import android.os.Bundle;
@@ -12,15 +14,14 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.view.GestureDetector;
+import android.view.Display;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.Gravity;
 import android.widget.Button;
-import android.widget.FrameLayout;
 import android.widget.GridLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -46,10 +47,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public final class MainActivity extends AppCompatActivity implements RecordingController.Listener {
-    private static final int REQUIRED_TEST_FRAMES = 3;
     private static final int MODE_TIMEOUT_MS = 5_000;
     private static final int GPU_FIRST_FRAME_TIMEOUT_MS = 2_500;
     private static final int PREVIEW_STALL_TIMEOUT_MS = 4_000;
@@ -59,6 +58,7 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
 
     private DirectUvcCameraSource cameraSource;
     private PhoneCameraSource phoneCameraSource;
+    private NetworkStreamSource networkSource;
     private RecordingController recordingController;
     private AspectRatioSurfaceView cameraView;
     private TextureView gpuCameraView;
@@ -70,21 +70,26 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
     private TextView signalInfo;
     private TextView recordInfo;
     private TextView auxInfo;
+    private TextView rtmpStatus;
     private Button mainRecordButton;
     private Button auxRecordButton;
     private Button signalModeButton;
     private Button deviceButton;
     private Button multiDeviceButton;
     private Button outputButton;
+    private View bottomControlsScroll;
+    private PhoneCameraSideControls phoneCameraSideControls;
     private AudioLevelMeterView audioLevelMeter;
     private AudioLevelMonitor audioLevelMonitor;
     private UvcSurfaceSource monitoredAudioSource;
     private GridLayout multiDeviceGrid;
     private MultiDeviceController multiDeviceController;
     private HdmiOutputController hdmiOutputController;
+    private RtmpStreamingController rtmpStreamingController;
+    private RtmpStreamingController.State lastRtmpState =
+            RtmpStreamingController.State.DISABLED;
     private GestureDetector gestureDetector;
     private UsbDevice currentDevice;
-    private VideoInputDevice currentInput;
     private SignalInfo currentSignal;
     private List<Size> supportedSizes = Collections.emptyList();
     private List<Format> supportedFormats = Collections.emptyList();
@@ -100,17 +105,46 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
     private int fallbackIndex;
     private int bandwidthIndex;
     private int outputRotation;
+    private int previewReferenceDisplayRotation = -1;
+    private int previewDisplayCompensation;
+    private DisplayManager displayManager;
+    private boolean displayListenerRegistered;
     private Size selectedMode;
     private int preferredDeviceId = -1;
-    private String preferredInputKey = "";
     private boolean multiDeviceMode;
+    private boolean networkInputSelected;
+    private boolean phoneInputMode;
+    private PhoneCameraCatalog.Device currentPhoneCamera;
+    private PhoneCameraCatalog.Mode currentPhoneMode;
     private boolean suppressOverlayGesture;
-    private final List<String> selectedMultiDeviceKeys = new ArrayList<>();
+    private final List<Integer> selectedMultiDeviceIds = new ArrayList<>();
+
+    private final DisplayManager.DisplayListener displayListener =
+            new DisplayManager.DisplayListener() {
+        @Override
+        public void onDisplayAdded(int displayId) {
+        }
+
+        @Override
+        public void onDisplayRemoved(int displayId) {
+        }
+
+        @Override
+        public void onDisplayChanged(int displayId) {
+            if (displayId == Display.DEFAULT_DISPLAY) {
+                applyPreviewDisplayCompensation();
+            }
+        }
+    };
 
     private final Runnable delayedCameraRelease = new Runnable() {
         @Override
         public void run() {
             if (started) return;
+            if (shouldKeepBackgroundUvcStreaming()) {
+                StreamingKeepAliveService.start(MainActivity.this);
+                return;
+            }
             if (UsbRecorderApplication.isAppInForeground()) {
                 lifecycleHandler.postDelayed(this, FOREGROUND_RELEASE_RECHECK_MS);
             } else {
@@ -139,7 +173,11 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
 
     private final ActivityResultLauncher<String[]> permissions = registerForActivityResult(
             new ActivityResultContracts.RequestMultiplePermissions(), result -> {
-                if (hasCameraPermission() && started) initCamera();
+                if (started) {
+                    if (phoneInputMode) initPhoneCamera();
+                    else if (networkInputSelected) initNetworkStream();
+                    else if (hasCameraPermission()) initCamera();
+                }
                 if (!hasCameraPermission()) {
                     Toast.makeText(this, R.string.permission_needed, Toast.LENGTH_LONG).show();
                 } else if (AppSettings.isUsbAudioEnabled(this) && !hasAudioPermission()) {
@@ -156,6 +194,45 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         setContentView(R.layout.activity_main);
         enterImmersiveMode();
         bindViews();
+        displayManager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+        phoneCameraSideControls = new PhoneCameraSideControls(findViewById(R.id.root),
+                this, new PhoneCameraSideControls.Host() {
+            @Override
+            public void cycleCamera() {
+                cyclePhoneCamera();
+            }
+
+            @Override
+            public void showCameraMode() {
+                showPhoneCameraModeDialog();
+            }
+
+            @Override
+            public void toggleRecording() {
+                mainRecordButton.performClick();
+            }
+
+            @Override
+            public void toggleTransmission() {
+                toggleCameraTransmission();
+            }
+
+            @Override
+            public void openSettings() {
+                openSettingsFromCameraMode();
+            }
+
+            @Override
+            public void microphoneChanged() {
+                onPhoneMicrophoneChanged();
+            }
+
+            @Override
+            public void cameraPanelChanged() {
+                updateAudioMeterPlacement();
+            }
+        });
+        rtmpStreamingController = new RtmpStreamingController(this, this::onRtmpStateChanged);
         audioLevelMonitor = new AudioLevelMonitor(this, new AudioLevelMonitor.Listener() {
             @Override
             public void onLevel(float normalized, float db) {
@@ -167,7 +244,13 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
                 audioLevelMeter.setUnavailable();
             }
         });
-        restoreSavedMultiSelectionState();
+        phoneInputMode = AppSettings.getInputMode(this) == AppSettings.InputMode.CAMERA;
+        networkInputSelected = !phoneInputMode && AppSettings.isNetworkInputSelected(this)
+                && AppSettings.isPullEnabled(this)
+                && SettingsActivity.isValidPullUrl(AppSettings.getPullUrl(this));
+        if (!phoneInputMode) restoreSavedMultiSelectionState();
+        restoreOutputRotationForActiveInput();
+        gpuCameraView.post(this::applyPreviewDisplayCompensation);
         hdmiOutputController = new HdmiOutputController(this,
                 new HdmiOutputController.Listener() {
                     @Override
@@ -193,8 +276,12 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
     protected void onStart() {
         super.onStart();
         started = true;
+        registerDisplayListener();
         lifecycleHandler.removeCallbacks(delayedCameraRelease);
-        if (hasCameraPermission()) initCamera();
+        syncInputModeSettings();
+        if (phoneInputMode) initPhoneCamera();
+        else if (networkInputSelected) initNetworkStream();
+        else if (hasCameraPermission()) initCamera();
     }
 
     @Override
@@ -203,18 +290,43 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         enterImmersiveMode();
         refreshSettingsUi();
         ButtonAppearance.apply(findViewById(R.id.root), AppSettings.getButtonOpacity(this));
+        syncInputModeSettings();
+        syncNetworkInputSettings();
         if (multiDeviceController != null) {
             multiDeviceController.refreshAudioConfiguration();
             multiDeviceController.setMetersVisible(overlay.getVisibility() == View.VISIBLE);
         }
         refreshAudioLevelMonitor();
+        syncRtmpStreaming();
+    }
+
+    @Override
+    public void onConfigurationChanged(@NonNull Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        enterImmersiveMode();
+        gpuCameraView.post(this::applyPreviewDisplayCompensation);
+        updateAudioMeterPlacement();
+        PhoneCameraSource source = phoneCameraSource;
+        if (source != null) {
+            if (gpuScreenSurface != null && gpuScreenSurface.isValid()) {
+                source.setScreenSurface(gpuScreenSurface,
+                        gpuCameraView.getWidth(), gpuCameraView.getHeight());
+            }
+        }
     }
 
     @Override
     protected void onStop() {
         started = false;
+        unregisterDisplayListener();
         healthHandler.removeCallbacks(previewHealthCheck);
         lifecycleHandler.removeCallbacks(delayedCameraRelease);
+        if (shouldKeepBackgroundUvcStreaming()) {
+            // Start while this user-visible Activity is transitioning to the
+            // background, before Android applies foreground-service start
+            // restrictions. The delayed release then leaves UVC/RTMP intact.
+            StreamingKeepAliveService.start(this);
+        }
         lifecycleHandler.postDelayed(delayedCameraRelease, CAMERA_RELEASE_DELAY_MS);
         super.onStop();
     }
@@ -223,13 +335,82 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
     protected void onDestroy() {
         lifecycleHandler.removeCallbacksAndMessages(null);
         healthHandler.removeCallbacksAndMessages(null);
+        StreamingKeepAliveService.stop(this);
         releaseInputs();
+        if (rtmpStreamingController != null) rtmpStreamingController.release();
         if (audioLevelMonitor != null) audioLevelMonitor.release();
         if (hdmiOutputController != null) hdmiOutputController.release();
         Surface surface = gpuScreenSurface;
         gpuScreenSurface = null;
         if (surface != null) surface.release();
         super.onDestroy();
+    }
+
+    private void registerDisplayListener() {
+        if (displayManager == null || displayListenerRegistered) return;
+        displayManager.registerDisplayListener(displayListener, lifecycleHandler);
+        displayListenerRegistered = true;
+        applyPreviewDisplayCompensation();
+    }
+
+    private void unregisterDisplayListener() {
+        if (displayManager == null || !displayListenerRegistered) return;
+        displayManager.unregisterDisplayListener(displayListener);
+        displayListenerRegistered = false;
+    }
+
+    private int currentDisplayRotation() {
+        Display display = getWindowManager().getDefaultDisplay();
+        return display == null ? Surface.ROTATION_0 : display.getRotation();
+    }
+
+    private void applyPreviewDisplayCompensation() {
+        int current = currentDisplayRotation();
+        if (previewReferenceDisplayRotation < 0) {
+            previewReferenceDisplayRotation = current;
+        }
+        int requestedCompensation = displayRotationCompensationDegrees(
+                previewReferenceDisplayRotation, current);
+        previewDisplayCompensation = landscapeDisplayCompensationDegrees(
+                previewReferenceDisplayRotation, current);
+        if (requestedCompensation != previewDisplayCompensation) {
+            // MainActivity is sensorLandscape. Android 15/16 can report the portrait
+            // launcher rotation briefly before WindowManager applies that request.
+            // Applying this transient quarter turn to the TextureView combines it
+            // with the user's UVC rotation and shrinks the frame a second time.
+            previewReferenceDisplayRotation = current;
+            previewDisplayCompensation = 0;
+        }
+        // Android rotates the entire activity when the tablet is turned to the
+        // opposite landscape edge. Counter-rotate only the preview Views so
+        // buttons follow the system while preview/recording pixels stay fixed.
+        gpuCameraView.setRotation(previewDisplayCompensation);
+        cameraView.setRotation(previewDisplayCompensation);
+        if (multiDeviceController != null) {
+            multiDeviceController.setPreviewDisplayCompensation(
+                    previewDisplayCompensation);
+        }
+    }
+
+    static int displayRotationCompensationDegrees(int referenceRotation,
+                                                  int currentRotation) {
+        int referenceDegrees = surfaceRotationDegrees(referenceRotation);
+        int currentDegrees = surfaceRotationDegrees(currentRotation);
+        return Math.floorMod(referenceDegrees - currentDegrees, 360);
+    }
+
+    static int landscapeDisplayCompensationDegrees(int referenceRotation,
+                                                    int currentRotation) {
+        int compensation = displayRotationCompensationDegrees(
+                referenceRotation, currentRotation);
+        return Math.floorMod(compensation, 180) == 0 ? compensation : 0;
+    }
+
+    private static int surfaceRotationDegrees(int rotation) {
+        if (rotation == Surface.ROTATION_90) return 90;
+        if (rotation == Surface.ROTATION_180) return 180;
+        if (rotation == Surface.ROTATION_270) return 270;
+        return 0;
     }
 
     @Override
@@ -257,12 +438,14 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         signalInfo = findViewById(R.id.signal_info);
         recordInfo = findViewById(R.id.record_info);
         auxInfo = findViewById(R.id.aux_info);
+        rtmpStatus = findViewById(R.id.rtmp_status);
         mainRecordButton = findViewById(R.id.main_record_button);
         auxRecordButton = findViewById(R.id.aux_record_button);
         signalModeButton = findViewById(R.id.signal_mode_button);
         deviceButton = findViewById(R.id.device_button);
         multiDeviceButton = findViewById(R.id.multi_device_button);
         outputButton = findViewById(R.id.output_button);
+        bottomControlsScroll = findViewById(R.id.bottom_controls_scroll);
         audioLevelMeter = findViewById(R.id.audio_level_meter);
         multiDeviceGrid = findViewById(R.id.multi_device_grid);
         mainRecordButton.setEnabled(false);
@@ -286,6 +469,10 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
 
     private void setControlsVisible(boolean visible) {
         overlay.setVisibility(visible ? View.VISIBLE : View.GONE);
+        if (phoneCameraSideControls != null) {
+            phoneCameraSideControls.setVisible(visible && phoneInputMode);
+        }
+        updateAudioMeterPlacement();
         if (multiDeviceMode && multiDeviceController != null) {
             audioLevelMeter.setVisibility(View.GONE);
             multiDeviceController.setMetersVisible(visible);
@@ -294,6 +481,24 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
                     && AppSettings.isUsbAudioEnabled(this) && hasAudioPermission();
             audioLevelMeter.setVisibility(showMeter ? View.VISIBLE : View.GONE);
         }
+    }
+
+    private void updateAudioMeterPlacement() {
+        if (audioLevelMeter == null) return;
+        int marginDp = 18;
+        if (phoneInputMode && phoneCameraSideControls != null
+                && phoneCameraSideControls.isVisible()) {
+            marginDp = phoneCameraSideControls.isAdjustmentVisible() ? 580 : 230;
+        }
+        int screenWidthDp = getResources().getConfiguration().screenWidthDp;
+        marginDp = Math.min(marginDp, Math.max(18, screenWidthDp - 82));
+        ViewGroup.LayoutParams raw = audioLevelMeter.getLayoutParams();
+        if (!(raw instanceof ViewGroup.MarginLayoutParams)) return;
+        ViewGroup.MarginLayoutParams params = (ViewGroup.MarginLayoutParams) raw;
+        int marginPx = Math.round(marginDp * getResources().getDisplayMetrics().density);
+        if (params.getMarginEnd() == marginPx) return;
+        params.setMarginEnd(marginPx);
+        audioLevelMeter.setLayoutParams(params);
     }
 
     private void setupSurface() {
@@ -317,19 +522,15 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             public void onSurfaceTextureAvailable(@NonNull SurfaceTexture texture,
                                                   int width, int height) {
                 setGpuScreenSurface(new Surface(texture), width, height);
-                if (phoneCameraSource != null && selectedMode != null && !previewReady) {
-                    texture.setDefaultBufferSize(selectedMode.width, selectedMode.height);
-                    layoutPhonePreview(selectedMode);
-                    applyPhonePreviewMode(selectedMode);
-                }
             }
 
             @Override
             public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture texture,
                                                     int width, int height) {
-                if (cameraSource != null && gpuScreenSurface != null
+                UvcSurfaceSource source = activeSingleSource();
+                if (source != null && gpuScreenSurface != null
                         && gpuCameraView.getVisibility() == View.VISIBLE) {
-                    cameraSource.setScreenSurface(gpuScreenSurface, width, height);
+                    source.setScreenSurface(gpuScreenSurface, width, height);
                 }
             }
 
@@ -351,9 +552,10 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
     }
 
     private void setGpuScreenSurface(Surface surface, int width, int height) {
-        if (cameraSource != null
+        UvcSurfaceSource source = activeSingleSource();
+        if (source != null
                 && (surface == null || gpuCameraView.getVisibility() == View.VISIBLE)) {
-            cameraSource.setScreenSurface(surface, width, height);
+            source.setScreenSurface(surface, width, height);
         }
         Surface old = gpuScreenSurface;
         gpuScreenSurface = surface;
@@ -414,53 +616,71 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             Toast.makeText(this, "请先停止录制再切换设备", Toast.LENGTH_SHORT).show();
             return;
         }
-        List<VideoInputDevice> devices = VideoInputDevice.listAll(this);
-        if (devices.isEmpty()) {
-            Toast.makeText(this, "没有检测到 UVC、采集卡或手机摄像头", Toast.LENGTH_SHORT).show();
+        if (phoneInputMode) {
+            cyclePhoneCamera();
             return;
         }
-        String[] labels = new String[devices.size()];
+        List<UsbDevice> devices = UsbDeviceCatalog.listVideoInputs(this);
+        boolean networkAvailable = AppSettings.isPullEnabled(this)
+                && SettingsActivity.isValidPullUrl(AppSettings.getPullUrl(this));
+        if (devices.isEmpty() && !networkAvailable) {
+            Toast.makeText(this, R.string.no_uvc_device, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        String[] labels = new String[devices.size() + (networkAvailable ? 1 : 0)];
         int checked = -1;
         for (int i = 0; i < devices.size(); i++) {
-            VideoInputDevice device = devices.get(i);
-            labels[i] = device.label;
-            if (!multiDeviceMode && ((currentInput != null && currentInput.equals(device))
-                    || preferredInputKey.equals(device.stableKey))) checked = i;
+            UsbDevice device = devices.get(i);
+            labels[i] = UsbDeviceCatalog.label(device);
+            if (!multiDeviceMode && !networkInputSelected && ((currentDevice != null
+                    && currentDevice.getDeviceId() == device.getDeviceId())
+                    || preferredDeviceId == device.getDeviceId())) checked = i;
+        }
+        int networkIndex = devices.size();
+        if (networkAvailable) {
+            labels[networkIndex] = networkInputLabel();
+            if (!multiDeviceMode && networkInputSelected) checked = networkIndex;
         }
         new AlertDialog.Builder(this)
-                .setTitle("切换摄像头 / UVC / 采集卡")
+                .setTitle("切换输入设备")
                 .setSingleChoiceItems(labels, checked, (dialog, which) -> {
                     dialog.dismiss();
-                    switchToSingleInput(devices.get(which));
+                    if (networkAvailable && which == networkIndex) switchToNetworkStream();
+                    else switchToSingleDevice(devices.get(which));
                 })
                 .setNegativeButton("取消", null)
                 .show();
     }
 
     private void showMultiDeviceDialog() {
+        if (phoneInputMode) {
+            Toast.makeText(this, "相机模式下请使用“设备”切换手机摄像头；"
+                    + "多路 UVC 分屏请先在设置切回 UVC 模式", Toast.LENGTH_LONG).show();
+            return;
+        }
         if (isBusy()) {
             Toast.makeText(this, "请先停止录制再修改多设备选择", Toast.LENGTH_SHORT).show();
             return;
         }
-        List<VideoInputDevice> devices = VideoInputDevice.listAll(this);
+        List<UsbDevice> devices = UsbDeviceCatalog.listVideoInputs(this);
         if (devices.size() < 2) {
-            Toast.makeText(this, "至少需要两个手机摄像头、UVC 或采集卡输入", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, "至少需要连接两个 UVC/采集卡设备", Toast.LENGTH_LONG).show();
             return;
         }
         String[] labels = new String[devices.size()];
         boolean[] checked = new boolean[devices.size()];
         List<String> savedKeys = AppSettings.getMultiDeviceKeys(this);
         for (int i = 0; i < devices.size(); i++) {
-            labels[i] = devices.get(i).label;
-            checked[i] = selectedMultiDeviceKeys.contains(devices.get(i).stableKey)
-                    || savedKeys.contains(devices.get(i).stableKey);
+            labels[i] = UsbDeviceCatalog.label(devices.get(i));
+            checked[i] = selectedMultiDeviceIds.contains(devices.get(i).getDeviceId())
+                    || savedKeys.contains(UsbDeviceCatalog.stableKey(devices.get(i)));
         }
         AlertDialog.Builder builder = new AlertDialog.Builder(this)
                 .setTitle("多选分屏录制设备（最多 4 路）")
                 .setMultiChoiceItems(labels, checked,
                         (dialog, which, isChecked) -> checked[which] = isChecked)
                 .setPositiveButton("开始分屏", (dialog, which) -> {
-                    List<VideoInputDevice> selected = new ArrayList<>();
+                    List<UsbDevice> selected = new ArrayList<>();
                     for (int i = 0; i < devices.size(); i++) {
                         if (checked[i]) selected.add(devices.get(i));
                     }
@@ -470,52 +690,87 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
                         Toast.makeText(this, "当前版本最多同时显示和录制 4 路",
                                 Toast.LENGTH_LONG).show();
                     } else {
-                        switchToMultiInputs(selected);
+                        switchToMultiDevices(selected);
                     }
                 })
                 .setNegativeButton("取消", null);
         if (multiDeviceMode) {
             builder.setNeutralButton("退出多设备", (dialog, which) -> {
-                List<VideoInputDevice> current = VideoInputDevice.listAll(this);
-                if (!current.isEmpty()) switchToSingleInput(current.get(0));
+                List<UsbDevice> current = UsbDeviceCatalog.listVideoInputs(this);
+                if (!current.isEmpty()) switchToSingleDevice(current.get(0));
             });
         }
         builder.show();
     }
 
-    private void switchToSingleInput(VideoInputDevice device) {
+    private void switchToSingleDevice(UsbDevice device) {
         multiDeviceMode = false;
-        selectedMultiDeviceKeys.clear();
+        networkInputSelected = false;
+        AppSettings.setNetworkInputSelected(this, false);
+        restoreOutputRotationForActiveInput();
+        selectedMultiDeviceIds.clear();
         AppSettings.clearMultiDevices(this);
-        currentInput = device;
-        preferredInputKey = device.stableKey;
-        preferredDeviceId = device.isUsb() ? device.usbDevice.getDeviceId() : -1;
-        AppSettings.savePreferredInput(this, device.stableKey);
+        preferredDeviceId = device.getDeviceId();
+        AppSettings.savePreferredDevice(this, device);
         releaseMultiDeviceController();
+        releaseNetworkSource();
         releaseCamera();
         multiDeviceGrid.setVisibility(View.GONE);
         cameraView.setVisibility(View.VISIBLE);
         gpuCameraView.setVisibility(View.VISIBLE);
         gpuCameraView.setAlpha(0f);
         multiDeviceButton.setText(R.string.multi_device);
-        noSignal.setText("正在切换到 " + device.label);
+        noSignal.setText("正在切换到 " + UsbDeviceCatalog.label(device));
         noSignal.setVisibility(View.VISIBLE);
         lifecycleHandler.postDelayed(() -> {
             if (started && !multiDeviceMode) initCamera();
         }, 850);
     }
 
-    private void switchToMultiInputs(List<VideoInputDevice> devices) {
-        multiDeviceMode = true;
-        selectedMultiDeviceKeys.clear();
-        for (VideoInputDevice device : devices) selectedMultiDeviceKeys.add(device.stableKey);
-        AppSettings.saveMultiInputs(this, devices);
+    private void switchToNetworkStream() {
+        String url = AppSettings.getPullUrl(this);
+        if (!AppSettings.isPullEnabled(this) || !SettingsActivity.isValidPullUrl(url)) {
+            Toast.makeText(this, R.string.pull_url_invalid, Toast.LENGTH_LONG).show();
+            return;
+        }
+        multiDeviceMode = false;
+        networkInputSelected = true;
+        AppSettings.setNetworkInputSelected(this, true);
+        restoreOutputRotationForActiveInput();
+        selectedMultiDeviceIds.clear();
+        AppSettings.clearMultiDevices(this);
+        preferredDeviceId = -1;
         if (hdmiOutputController != null) hdmiOutputController.stop();
+        releaseMultiDeviceController();
+        releaseCamera();
+        releaseNetworkSource();
+        multiDeviceGrid.setVisibility(View.GONE);
+        cameraView.setVisibility(View.INVISIBLE);
+        gpuCameraView.setVisibility(View.VISIBLE);
+        gpuCameraView.setAlpha(1f);
+        multiDeviceButton.setText(R.string.multi_device);
+        noSignal.setText("正在连接 RTMP 网络流…");
+        noSignal.setVisibility(View.VISIBLE);
+        lifecycleHandler.postDelayed(() -> {
+            if (started && networkInputSelected && !multiDeviceMode) initNetworkStream();
+        }, 250);
+    }
+
+    private void switchToMultiDevices(List<UsbDevice> devices) {
+        multiDeviceMode = true;
+        networkInputSelected = false;
+        AppSettings.setNetworkInputSelected(this, false);
+        restoreOutputRotationForActiveInput();
+        selectedMultiDeviceIds.clear();
+        for (UsbDevice device : devices) selectedMultiDeviceIds.add(device.getDeviceId());
+        AppSettings.saveMultiDevices(this, devices);
+        if (hdmiOutputController != null) hdmiOutputController.stop();
+        releaseNetworkSource();
         releaseCamera();
         releaseMultiDeviceController();
         cameraView.setVisibility(View.GONE);
         gpuCameraView.setVisibility(View.GONE);
-        noSignal.setText("正在启动 " + devices.size() + " 路摄像头分屏…");
+        noSignal.setText("正在启动 " + devices.size() + " 路 UVC 分屏…");
         noSignal.setVisibility(View.VISIBLE);
         multiDeviceGrid.setVisibility(View.VISIBLE);
         multiDeviceButton.setText(R.string.multi_device_active);
@@ -527,43 +782,46 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
     }
 
     private void restoreMultiDeviceController() {
-        List<VideoInputDevice> available = VideoInputDevice.listAll(this);
-        List<VideoInputDevice> selected = new ArrayList<>();
-        for (VideoInputDevice device : available) {
-            if (selectedMultiDeviceKeys.contains(device.stableKey)) selected.add(device);
+        List<UsbDevice> available = UsbDeviceCatalog.listVideoInputs(this);
+        List<UsbDevice> selected = new ArrayList<>();
+        for (UsbDevice device : available) {
+            if (selectedMultiDeviceIds.contains(device.getDeviceId())) selected.add(device);
         }
         if (selected.size() < 2) selected = matchSavedMultiDevices(available);
         if (selected.size() < 2) {
             multiDeviceMode = false;
-            selectedMultiDeviceKeys.clear();
+            selectedMultiDeviceIds.clear();
             multiDeviceGrid.setVisibility(View.GONE);
             cameraView.setVisibility(View.VISIBLE);
             gpuCameraView.setVisibility(View.VISIBLE);
             initCamera();
             return;
         }
-        selectedMultiDeviceKeys.clear();
-        for (VideoInputDevice device : selected) selectedMultiDeviceKeys.add(device.stableKey);
+        selectedMultiDeviceIds.clear();
+        for (UsbDevice device : selected) selectedMultiDeviceIds.add(device.getDeviceId());
         createMultiDeviceController(selected);
     }
 
     private void restoreSavedMultiSelectionState() {
-        List<VideoInputDevice> selected = matchSavedMultiDevices(VideoInputDevice.listAll(this));
+        List<UsbDevice> selected = matchSavedMultiDevices(
+                UsbDeviceCatalog.listVideoInputs(this));
         if (selected.size() < 2) return;
         multiDeviceMode = true;
-        selectedMultiDeviceKeys.clear();
-        for (VideoInputDevice device : selected) selectedMultiDeviceKeys.add(device.stableKey);
+        networkInputSelected = false;
+        AppSettings.setNetworkInputSelected(this, false);
+        selectedMultiDeviceIds.clear();
+        for (UsbDevice device : selected) selectedMultiDeviceIds.add(device.getDeviceId());
         cameraView.setVisibility(View.GONE);
         gpuCameraView.setVisibility(View.GONE);
         multiDeviceGrid.setVisibility(View.VISIBLE);
         multiDeviceButton.setText(R.string.multi_device_active);
     }
 
-    private List<VideoInputDevice> matchSavedMultiDevices(List<VideoInputDevice> available) {
+    private List<UsbDevice> matchSavedMultiDevices(List<UsbDevice> available) {
         List<String> remaining = new ArrayList<>(AppSettings.getMultiDeviceKeys(this));
-        List<VideoInputDevice> result = new ArrayList<>();
-        for (VideoInputDevice device : available) {
-            int match = remaining.indexOf(device.stableKey);
+        List<UsbDevice> result = new ArrayList<>();
+        for (UsbDevice device : available) {
+            int match = remaining.indexOf(UsbDeviceCatalog.stableKey(device));
             if (match >= 0) {
                 result.add(device);
                 remaining.remove(match);
@@ -572,13 +830,15 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         return result;
     }
 
-    private void createMultiDeviceController(List<VideoInputDevice> devices) {
+    private void createMultiDeviceController(List<UsbDevice> devices) {
         if (multiDeviceController != null || !multiDeviceMode) return;
         cameraView.setVisibility(View.GONE);
         gpuCameraView.setVisibility(View.GONE);
         multiDeviceGrid.setVisibility(View.VISIBLE);
         multiDeviceController = new MultiDeviceController(this, multiDeviceGrid, devices,
                 multiDeviceListener);
+        multiDeviceController.setOutputRotation(outputRotation);
+        multiDeviceController.setPreviewDisplayCompensation(previewDisplayCompensation);
         multiDeviceController.setMetersVisible(overlay.getVisibility() == View.VISIBLE);
     }
 
@@ -589,8 +849,119 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
     }
 
     private void releaseInputs() {
+        StreamingKeepAliveService.stop(this);
+        stopRtmpStreaming();
+        releasePhoneCamera();
         releaseCamera();
+        releaseNetworkSource();
         releaseMultiDeviceController();
+    }
+
+    private UvcSurfaceSource activeSingleSource() {
+        if (phoneInputMode) return phoneCameraSource;
+        return networkInputSelected ? networkSource : cameraSource;
+    }
+
+    private void syncRtmpStreaming() {
+        if (rtmpStreamingController == null) return;
+        if (!AppSettings.isRtmpEnabled(this)) {
+            rtmpStreamingController.sync(null, 0, 0, 0, "");
+            return;
+        }
+        if (multiDeviceMode) {
+            if (!previewReady || multiDeviceController == null) {
+                rtmpStreamingController.sync(null, 0, 0, 0, "");
+                return;
+            }
+            List<MultiDeviceController.LiveSource> sources =
+                    multiDeviceController.readyLiveSources();
+            if (sources.isEmpty()) {
+                rtmpStreamingController.sync(null, 0, 0, 0, "");
+                return;
+            }
+            MultiDeviceController.LiveSource current = sources.get(0);
+            rtmpStreamingController.sync(current.source, current.width, current.height,
+                    current.fps, current.label);
+            return;
+        }
+        UvcSurfaceSource source = activeSingleSource();
+        if (!previewReady || source == null || currentSignal == null) {
+            rtmpStreamingController.sync(null, 0, 0, 0, "");
+            return;
+        }
+        // Keep the RTMP encoder canvas tied to the input signal. Rotation is a
+        // live GPU transform inside this fixed canvas, so a 90-degree tap does
+        // not require tearing down and publishing a new RTMP session.
+        int width = currentSignal.width;
+        int height = currentSignal.height;
+        String label = phoneInputMode && currentPhoneCamera != null
+                ? currentPhoneCamera.label
+                : networkInputSelected ? "RTMP 网络流"
+                : currentDevice == null ? "当前信号" : deviceLabel(currentDevice);
+        rtmpStreamingController.sync(source, width, height, currentSignal.fps, label);
+    }
+
+    private void stopRtmpStreaming() {
+        if (rtmpStreamingController != null) rtmpStreamingController.stop();
+        if (!shouldKeepBackgroundUvcStreaming()) {
+            StreamingKeepAliveService.stop(this);
+        }
+    }
+
+    private void onRtmpStateChanged(RtmpStreamingController.State state, String detail) {
+        if (shouldKeepBackgroundUvcStreaming()) {
+            // Start the microphone foreground-service type while the Activity
+            // is still visible. Android 14+ otherwise revokes AudioRecord/UAC
+            // capture when the display turns off even though video continues.
+            StreamingKeepAliveService.start(this);
+        } else {
+            StreamingKeepAliveService.stop(this);
+        }
+        if (rtmpStatus == null) return;
+        if (phoneCameraSideControls != null) phoneCameraSideControls.refreshTransmit();
+        boolean enabled = AppSettings.isRtmpEnabled(this);
+        rtmpStatus.setVisibility(enabled || state != RtmpStreamingController.State.DISABLED
+                ? View.VISIBLE : View.GONE);
+        rtmpStatus.setTextColor(ContextCompat.getColor(this,
+                state == RtmpStreamingController.State.ERROR
+                        ? R.color.record_red : R.color.accent));
+        switch (state) {
+            case DISABLED:
+                rtmpStatus.setVisibility(View.GONE);
+                break;
+            case WAITING:
+                rtmpStatus.setText(R.string.rtmp_status_idle);
+                break;
+            case PREPARING:
+            case CONNECTING:
+                rtmpStatus.setText(R.string.rtmp_status_connecting);
+                break;
+            case LIVE:
+                rtmpStatus.setText(getString(R.string.rtmp_status_live, detail));
+                if (lastRtmpState != RtmpStreamingController.State.LIVE) {
+                    Toast.makeText(this, "RTMP 推流已连接", Toast.LENGTH_SHORT).show();
+                }
+                break;
+            case RETRYING:
+                rtmpStatus.setText(detail == null || detail.trim().isEmpty()
+                        ? getString(R.string.rtmp_status_retry) : "RTMP：" + detail);
+                break;
+            case ERROR:
+                rtmpStatus.setText(getString(R.string.rtmp_status_error, detail));
+                if (lastRtmpState != RtmpStreamingController.State.ERROR) {
+                    Toast.makeText(this, "RTMP 推流失败：" + detail, Toast.LENGTH_LONG).show();
+                }
+                break;
+        }
+        lastRtmpState = state;
+    }
+
+    private boolean shouldKeepBackgroundUvcStreaming() {
+        return !phoneInputMode
+                && !networkInputSelected
+                && AppSettings.isRtmpEnabled(this)
+                && rtmpStreamingController != null
+                && rtmpStreamingController.isDesired();
     }
 
     private final MultiDeviceController.Listener multiDeviceListener =
@@ -608,6 +979,7 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             refreshAudioLevelMonitor();
             refreshRecordingButtons(false, false);
             auxRecordButton.setVisibility(View.GONE);
+            syncRtmpStreaming();
         }
 
         @Override
@@ -691,7 +1063,9 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             return;
         }
         List<String> choices = new ArrayList<>();
-        choices.add(getString(R.string.hdmi_output_live));
+        choices.add(phoneInputMode ? "输出手机摄像头信号"
+                : networkInputSelected ? "输出 RTMP 拉流信号"
+                : getString(R.string.hdmi_output_live));
         choices.add(getString(R.string.hdmi_output_file));
         List<UsbDevice> cardOutputs = UsbDeviceCatalog.listVideoInputs(this);
         for (UsbDevice device : cardOutputs) {
@@ -702,13 +1076,12 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
                 .setTitle(R.string.hdmi_output_title)
                 .setItems(choices.toArray(new String[0]), (dialog, which) -> {
                     if (which == 0) {
-                        UvcSurfaceSource liveSource = cameraSource != null
-                                ? cameraSource : phoneCameraSource;
-                        if (!previewReady || liveSource == null) {
-                            Toast.makeText(this, "当前摄像头信号尚未就绪", Toast.LENGTH_SHORT).show();
+                        UvcSurfaceSource source = activeSingleSource();
+                        if (!previewReady || source == null) {
+                            Toast.makeText(this, "当前输入信号尚未就绪", Toast.LENGTH_SHORT).show();
                             return;
                         }
-                        hdmiOutputController.startLive(liveSource);
+                        hdmiOutputController.startLive(source);
                     } else if (which == 1) {
                         if (isBusy()) {
                             Toast.makeText(this, "请先停止录制再选择输出文件",
@@ -772,59 +1145,328 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
                 ? "HDMI 输出中：" + displayName : getString(R.string.hdmi_output));
     }
 
+    private void syncInputModeSettings() {
+        boolean desiredPhone =
+                AppSettings.getInputMode(this) == AppSettings.InputMode.CAMERA;
+        bottomControlsScroll.setVisibility(desiredPhone ? View.GONE : View.VISIBLE);
+        deviceButton.setVisibility(desiredPhone ? View.GONE : View.VISIBLE);
+        signalModeButton.setVisibility(desiredPhone ? View.GONE : View.VISIBLE);
+        multiDeviceButton.setVisibility(desiredPhone ? View.GONE : View.VISIBLE);
+        if (phoneCameraSideControls != null) {
+            phoneCameraSideControls.setVisible(desiredPhone
+                    && overlay.getVisibility() == View.VISIBLE);
+        }
+        updateAudioMeterPlacement();
+        multiDeviceButton.setEnabled(!desiredPhone);
+        if (desiredPhone == phoneInputMode) return;
+        if (isBusy()) return;
+        phoneInputMode = desiredPhone;
+        multiDeviceMode = false;
+        networkInputSelected = false;
+        AppSettings.setNetworkInputSelected(this, false);
+        restoreOutputRotationForActiveInput();
+        selectedMultiDeviceIds.clear();
+        releaseMultiDeviceController();
+        releasePhoneCamera();
+        releaseNetworkSource();
+        releaseCamera();
+        multiDeviceGrid.setVisibility(View.GONE);
+        cameraView.setVisibility(View.INVISIBLE);
+        gpuCameraView.setVisibility(View.VISIBLE);
+        gpuCameraView.setAlpha(1f);
+        multiDeviceButton.setText(R.string.multi_device);
+        if (!started || !hasCameraPermission()) return;
+        if (phoneInputMode) initPhoneCamera();
+        else initCamera();
+    }
+
+    private void cyclePhoneCamera() {
+        if (!phoneInputMode || isBusy()) {
+            if (isBusy()) {
+                Toast.makeText(this, "请先停止录制再切换镜头",
+                        Toast.LENGTH_SHORT).show();
+            }
+            return;
+        }
+        List<PhoneCameraCatalog.Device> devices = PhoneCameraCatalog.list(this);
+        if (devices.isEmpty()) {
+            Toast.makeText(this, "没有检测到可用的手机摄像头",
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+        int currentIndex = -1;
+        if (currentPhoneCamera != null) {
+            for (int index = 0; index < devices.size(); index++) {
+                if (devices.get(index).id.equals(currentPhoneCamera.id)) {
+                    currentIndex = index;
+                    break;
+                }
+            }
+        }
+        PhoneCameraCatalog.Device next =
+                devices.get((currentIndex + 1 + devices.size()) % devices.size());
+        AppSettings.setPhoneCameraId(this, next.id);
+        releasePhoneCamera();
+        lifecycleHandler.postDelayed(this::initPhoneCamera, 220L);
+        Toast.makeText(this, "切换到 " + next.label, Toast.LENGTH_SHORT).show();
+    }
+
+    private void toggleCameraTransmission() {
+        boolean enabled = AppSettings.isRtmpEnabled(this);
+        if (!enabled && !SettingsActivity.isValidRtmpUrl(AppSettings.getRtmpUrl(this))) {
+            Toast.makeText(this, R.string.rtmp_url_invalid, Toast.LENGTH_LONG).show();
+            startActivity(new Intent(this, SettingsActivity.class));
+            return;
+        }
+        AppSettings.setRtmpEnabled(this, !enabled);
+        if (enabled) stopRtmpStreaming();
+        syncRtmpStreaming();
+        if (phoneCameraSideControls != null) phoneCameraSideControls.refreshTransmit();
+    }
+
+    private void openSettingsFromCameraMode() {
+        if (isBusy()) {
+            Toast.makeText(this, "请先停止录制再修改设置",
+                    Toast.LENGTH_SHORT).show();
+            return;
+        }
+        startActivity(new Intent(this, SettingsActivity.class));
+    }
+
+    private void onPhoneMicrophoneChanged() {
+        stopAudioLevelMonitor();
+        stopRtmpStreaming();
+        refreshSettingsUi();
+        refreshAudioLevelMonitor();
+        lifecycleHandler.postDelayed(this::syncRtmpStreaming, 250L);
+    }
+
+    private void initPhoneCamera() {
+        if (!phoneInputMode || !started || phoneCameraSource != null) return;
+        restoreOutputRotationForActiveInput();
+        if (!hasCameraPermission()) {
+            requestNeededPermissions();
+            return;
+        }
+        List<PhoneCameraCatalog.Device> devices = PhoneCameraCatalog.list(this);
+        PhoneCameraCatalog.Device device = PhoneCameraCatalog.find(devices,
+                AppSettings.getPhoneCameraId(this));
+        if (device == null) {
+            noSignal.setText("没有检测到可用的手机摄像头");
+            noSignal.setVisibility(View.VISIBLE);
+            return;
+        }
+        // The selected format is shared by every phone lens. A lens that
+        // cannot expose the exact mode receives the closest mode without
+        // replacing the user's global preference.
+        int[] saved = AppSettings.getPhoneCameraMode(this);
+        PhoneCameraCatalog.Mode mode = PhoneCameraCatalog.chooseMode(device, saved);
+        if (mode == null) {
+            noSignal.setText(device.label + " 没有可用的 Camera2 输出模式");
+            noSignal.setVisibility(View.VISIBLE);
+            return;
+        }
+        currentPhoneCamera = device;
+        currentPhoneMode = mode;
+        AppSettings.setPhoneCameraId(this, device.id);
+        previewReady = false;
+        currentSignal = null;
+        cameraView.setVisibility(View.INVISIBLE);
+        gpuCameraView.setVisibility(View.VISIBLE);
+        gpuCameraView.setAlpha(1f);
+        multiDeviceGrid.setVisibility(View.GONE);
+        deviceInfo.setText(device.label);
+        signalInfo.setText("正在打开 " + mode.label());
+        noSignal.setText("正在启动手机摄像头…");
+        noSignal.setVisibility(View.VISIBLE);
+        mainRecordButton.setEnabled(false);
+        signalModeButton.setEnabled(false);
+        PhoneCameraSource next = new PhoneCameraSource(this, device, mode,
+                phoneCameraListener);
+        phoneCameraSource = next;
+        next.setOutputRotation(outputRotation);
+        next.start();
+        if (gpuScreenSurface != null && gpuScreenSurface.isValid()) {
+            next.setScreenSurface(gpuScreenSurface,
+                    gpuCameraView.getWidth(), gpuCameraView.getHeight());
+        }
+    }
+
+    private void releasePhoneCamera() {
+        stopRtmpStreaming();
+        stopAudioLevelMonitor();
+        previewReady = false;
+        if (recordingController != null) {
+            recordingController.release();
+            recordingController = null;
+        }
+        PhoneCameraSource source = phoneCameraSource;
+        phoneCameraSource = null;
+        if (source != null) {
+            if (hdmiOutputController != null) hdmiOutputController.detachLiveSource(source);
+            source.release();
+        }
+        currentPhoneCamera = null;
+        currentPhoneMode = null;
+        if (phoneCameraSideControls != null) phoneCameraSideControls.clear();
+        currentSignal = null;
+        mainRecordButton.setEnabled(false);
+        signalModeButton.setEnabled(false);
+    }
+
+    private final PhoneCameraSource.Listener phoneCameraListener =
+            new PhoneCameraSource.Listener() {
+        @Override
+        public void onConnecting(String detail) {
+            if (!phoneInputMode || phoneCameraSource == null) return;
+            if (!isBusy()) {
+                previewReady = false;
+                mainRecordButton.setEnabled(false);
+            }
+            noSignal.setText(detail);
+            noSignal.setVisibility(View.VISIBLE);
+        }
+
+        @Override
+        public void onReady(int width, int height, int fps) {
+            PhoneCameraSource source = phoneCameraSource;
+            if (!phoneInputMode || source == null || currentPhoneCamera == null
+                    || currentPhoneMode == null) return;
+            SignalInfo nextSignal = SignalInfo.network(width, height, fps, "Camera2");
+            boolean changed = currentSignal == null || currentSignal.width != width
+                    || currentSignal.height != height || currentSignal.fps != fps;
+            currentSignal = nextSignal;
+            previewReady = true;
+            lastGpuFrameAt = SystemClock.elapsedRealtime();
+            deviceInfo.setText(currentPhoneCamera.label);
+            updateSignalSummary();
+            noSignal.setVisibility(View.GONE);
+            signalModeButton.setEnabled(true);
+            mainRecordButton.setEnabled(true);
+            if (recordingController == null
+                    || (changed && !recordingController.isAnythingActive())) {
+                if (recordingController != null) recordingController.release();
+                recordingController = new RecordingController(MainActivity.this, source,
+                        currentSignal, MainActivity.this,
+                        "CAM_" + currentPhoneCamera.id, true);
+            }
+            if (hdmiOutputController != null
+                    && hdmiOutputController.getMode() == HdmiOutputController.Mode.LIVE) {
+                hdmiOutputController.attachLiveSource(source);
+            }
+            int[] preferredMode = AppSettings.getPhoneCameraMode(MainActivity.this);
+            if (!PhoneCameraCatalog.isVisibleSelection(preferredMode)) {
+                AppSettings.savePhoneCameraMode(MainActivity.this, currentPhoneCamera.id,
+                        currentPhoneMode.width, currentPhoneMode.height,
+                        currentPhoneMode.fps);
+            }
+            refreshSettingsUi();
+            refreshAudioLevelMonitor();
+            syncRtmpStreaming();
+            if (phoneCameraSideControls != null) {
+                phoneCameraSideControls.bind(currentPhoneCamera, currentPhoneMode, source);
+            }
+            if (getIntent().getBooleanExtra("show_camera_controls", false)) {
+                getIntent().removeExtra("show_camera_controls");
+                lifecycleHandler.postDelayed(() -> setControlsVisible(true), 180L);
+            }
+        }
+
+        @Override
+        public void onError(String message, Throwable error) {
+            if (!phoneInputMode || phoneCameraSource == null) return;
+            noSignal.setText("手机摄像头：" + message);
+            noSignal.setVisibility(View.VISIBLE);
+        }
+    };
+
+    private void showPhoneCameraDialog() {
+        List<PhoneCameraCatalog.Device> devices = PhoneCameraCatalog.list(this);
+        if (devices.isEmpty()) {
+            Toast.makeText(this, "没有检测到可用的手机摄像头",
+                    Toast.LENGTH_LONG).show();
+            return;
+        }
+        String[] labels = new String[devices.size()];
+        int checked = -1;
+        for (int i = 0; i < devices.size(); i++) {
+            labels[i] = devices.get(i).label + " · " + devices.get(i).modes.size() + " 种模式";
+            if (currentPhoneCamera != null
+                    && currentPhoneCamera.id.equals(devices.get(i).id)) checked = i;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("选择手机摄像头")
+                .setSingleChoiceItems(labels, checked, (dialog, which) -> {
+                    dialog.dismiss();
+                    PhoneCameraCatalog.Device selected = devices.get(which);
+                    AppSettings.setPhoneCameraId(this, selected.id);
+                    releasePhoneCamera();
+                    lifecycleHandler.postDelayed(this::initPhoneCamera, 300);
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void showPhoneCameraModeDialog() {
+        if (currentPhoneCamera == null || currentPhoneCamera.modes.isEmpty()) return;
+        List<PhoneCameraCatalog.Mode> modes = currentPhoneCamera.modes;
+        String[] labels = new String[modes.size()];
+        int checked = -1;
+        for (int i = 0; i < modes.size(); i++) {
+            labels[i] = modes.get(i).label();
+            if (currentPhoneMode != null
+                    && currentPhoneMode.width == modes.get(i).width
+                    && currentPhoneMode.height == modes.get(i).height
+                    && currentPhoneMode.fps == modes.get(i).fps) checked = i;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("选择 " + currentPhoneCamera.label + " 模式")
+                .setSingleChoiceItems(labels, checked, (dialog, which) -> {
+                    dialog.dismiss();
+                    PhoneCameraCatalog.Mode selected = modes.get(which);
+                    AppSettings.savePhoneCameraMode(this, currentPhoneCamera.id,
+                            selected.width, selected.height, selected.fps);
+                    releasePhoneCamera();
+                    lifecycleHandler.postDelayed(this::initPhoneCamera, 300);
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
     private void initCamera() {
+        if (phoneInputMode) {
+            initPhoneCamera();
+            return;
+        }
+        if (networkInputSelected) {
+            initNetworkStream();
+            return;
+        }
+        restoreOutputRotationForActiveInput();
         if (multiDeviceMode) {
             if (multiDeviceController == null) restoreMultiDeviceController();
             return;
         }
-        if (cameraSource != null || phoneCameraSource != null) return;
-        List<VideoInputDevice> available = VideoInputDevice.listAll(this);
-        if (available.isEmpty()) {
-            noSignal.setText("请连接 UVC/采集卡，或确认手机摄像头权限");
-            noSignal.setVisibility(View.VISIBLE);
-            return;
+        if (cameraSource != null) return;
+        List<UsbDevice> availableDevices = UsbDeviceCatalog.listVideoInputs(this);
+        boolean preferredIdPresent = false;
+        for (UsbDevice device : availableDevices) {
+            if (device.getDeviceId() == preferredDeviceId) preferredIdPresent = true;
         }
-        if (preferredInputKey.isEmpty()) preferredInputKey = AppSettings.getPreferredInputKey(this);
-        VideoInputDevice selected = currentInput;
-        if (selected == null || !available.contains(selected)) {
-            selected = null;
-            for (VideoInputDevice candidate : available) {
-                if (candidate.stableKey.equals(preferredInputKey)) {
-                    selected = candidate;
+        if (!preferredIdPresent) preferredDeviceId = -1;
+        if (preferredDeviceId < 0) {
+            for (UsbDevice device : availableDevices) {
+                if (AppSettings.isPreferredDevice(this, device)) {
+                    preferredDeviceId = device.getDeviceId();
                     break;
-                }
-                if (candidate.isUsb() && AppSettings.isPreferredDevice(this, candidate.usbDevice)) {
-                    selected = candidate;
                 }
             }
         }
-        if (selected == null) selected = available.get(0);
-        currentInput = selected;
-        preferredInputKey = selected.stableKey;
-        if (selected.isPhoneCamera()) {
-            initPhoneCamera(selected);
-            return;
-        }
-        resetPhonePreviewTransform();
-        preferredDeviceId = selected.usbDevice.getDeviceId();
-        currentDevice = selected.usbDevice;
-        cameraSource = new DirectUvcCameraSource(this, preferredDeviceId, cameraListener);
+        cameraSource = preferredDeviceId >= 0
+                ? new DirectUvcCameraSource(this, preferredDeviceId, cameraListener)
+                : new DirectUvcCameraSource(this, cameraListener);
         cameraSource.setOutputRotation(outputRotation);
         cameraSource.start();
-    }
-
-    private void initPhoneCamera(VideoInputDevice input) {
-        preferredDeviceId = -1;
-        currentDevice = null;
-        deviceInfo.setText(input.label);
-        noSignal.setText("正在打开 " + input.label + "…");
-        noSignal.setVisibility(View.VISIBLE);
-        cameraView.setVisibility(View.GONE);
-        gpuCameraView.setVisibility(View.VISIBLE);
-        gpuCameraView.setAlpha(1f);
-        phoneCameraSource = new PhoneCameraSource(this, input.logicalCameraId,
-                input.physicalCameraId, phoneCameraListener);
-        phoneCameraSource.start();
     }
 
     private void rotateOutputClockwise() {
@@ -834,16 +1476,18 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             return;
         }
         if (multiDeviceMode) {
-            if (multiDeviceController != null) multiDeviceController.rotateClockwise();
-            return;
-        }
-        if (phoneCameraSource != null) {
-            Toast.makeText(this, "手机摄像头按传感器方向输出，当前版本不额外旋转该路",
-                    Toast.LENGTH_SHORT).show();
+            outputRotation = (outputRotation + 90) % 360;
+            AppSettings.setVideoRotation(this, activeRotationProfile(), outputRotation);
+            if (multiDeviceController != null) {
+                multiDeviceController.setOutputRotation(outputRotation);
+            }
+            lifecycleHandler.postDelayed(this::syncRtmpStreaming, 350);
             return;
         }
         outputRotation = (outputRotation + 90) % 360;
-        if (cameraSource != null) cameraSource.setOutputRotation(outputRotation);
+        AppSettings.setVideoRotation(this, activeRotationProfile(), outputRotation);
+        UvcSurfaceSource source = activeSingleSource();
+        if (source != null) source.setOutputRotation(outputRotation);
         updateSignalSummary();
 
         if (currentSignal != null) {
@@ -854,9 +1498,21 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             Toast.makeText(this, "预览与录制已旋转 " + outputRotation + "°，录制输出 "
                     + width + "×" + height, Toast.LENGTH_SHORT).show();
         }
+        syncRtmpStreaming();
+    }
+
+    private AppSettings.VideoRotationProfile activeRotationProfile() {
+        if (phoneInputMode) return AppSettings.VideoRotationProfile.CAMERA;
+        if (networkInputSelected) return AppSettings.VideoRotationProfile.NETWORK;
+        return AppSettings.VideoRotationProfile.UVC;
+    }
+
+    private void restoreOutputRotationForActiveInput() {
+        outputRotation = AppSettings.getVideoRotation(this, activeRotationProfile());
     }
 
     private void releaseCamera() {
+        stopRtmpStreaming();
         stopAudioLevelMonitor();
         previewGeneration++;
         awaitingGpuGeneration = -1;
@@ -876,13 +1532,6 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             cameraSource.release();
             cameraSource = null;
         }
-        if (phoneCameraSource != null) {
-            if (hdmiOutputController != null) {
-                hdmiOutputController.detachLiveSource(phoneCameraSource);
-            }
-            phoneCameraSource.release();
-            phoneCameraSource = null;
-        }
         currentDevice = null;
         currentSignal = null;
         selectedMode = null;
@@ -893,6 +1542,156 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         mainRecordButton.setEnabled(false);
         signalModeButton.setEnabled(false);
     }
+
+    private void releaseNetworkSource() {
+        stopRtmpStreaming();
+        stopAudioLevelMonitor();
+        previewReady = false;
+        if (recordingController != null) {
+            recordingController.release();
+            recordingController = null;
+        }
+        NetworkStreamSource source = networkSource;
+        networkSource = null;
+        if (source != null) {
+            if (hdmiOutputController != null) hdmiOutputController.detachLiveSource(source);
+            source.release();
+        }
+        currentDevice = null;
+        currentSignal = null;
+        noSignal.setVisibility(View.VISIBLE);
+        mainRecordButton.setEnabled(false);
+        signalModeButton.setEnabled(false);
+    }
+
+    private void initNetworkStream() {
+        if (!networkInputSelected || multiDeviceMode || !started) return;
+        restoreOutputRotationForActiveInput();
+        String url = AppSettings.getPullUrl(this);
+        if (!AppSettings.isPullEnabled(this) || !SettingsActivity.isValidPullUrl(url)) {
+            networkInputSelected = false;
+            AppSettings.setNetworkInputSelected(this, false);
+            restoreOutputRotationForActiveInput();
+            noSignal.setText(R.string.pull_url_invalid);
+            noSignal.setVisibility(View.VISIBLE);
+            if (hasCameraPermission()) initCamera();
+            return;
+        }
+        if (networkSource != null && networkSource.matchesUrl(url)) return;
+        if (cameraSource != null) releaseCamera();
+        if (networkSource != null) releaseNetworkSource();
+        previewReady = false;
+        currentDevice = null;
+        currentSignal = null;
+        cameraView.setVisibility(View.INVISIBLE);
+        gpuCameraView.setVisibility(View.VISIBLE);
+        gpuCameraView.setAlpha(1f);
+        multiDeviceGrid.setVisibility(View.GONE);
+        signalModeButton.setEnabled(false);
+        mainRecordButton.setEnabled(false);
+        deviceInfo.setText(networkInputLabel());
+        signalInfo.setText("正在协商网络视频格式…");
+        noSignal.setText("正在连接 RTMP 网络流…");
+        noSignal.setVisibility(View.VISIBLE);
+        NetworkStreamSource next = new NetworkStreamSource(this, url, networkStreamListener);
+        networkSource = next;
+        next.setOutputRotation(outputRotation);
+        next.start();
+        if (gpuScreenSurface != null && gpuScreenSurface.isValid()) {
+            next.setScreenSurface(gpuScreenSurface,
+                    gpuCameraView.getWidth(), gpuCameraView.getHeight());
+        }
+    }
+
+    private void syncNetworkInputSettings() {
+        if (phoneInputMode) {
+            networkInputSelected = false;
+            return;
+        }
+        boolean selected = AppSettings.isNetworkInputSelected(this);
+        boolean configured = AppSettings.isPullEnabled(this)
+                && SettingsActivity.isValidPullUrl(AppSettings.getPullUrl(this));
+        if (networkInputSelected && (!selected || !configured)) {
+            networkInputSelected = false;
+            restoreOutputRotationForActiveInput();
+            releaseNetworkSource();
+            if (started && hasCameraPermission()) initCamera();
+            return;
+        }
+        if (selected && configured) {
+            if (!networkInputSelected) {
+                networkInputSelected = true;
+                restoreOutputRotationForActiveInput();
+            }
+            if (started && (networkSource == null
+                    || !networkSource.matchesUrl(AppSettings.getPullUrl(this)))) {
+                releaseNetworkSource();
+                initNetworkStream();
+            }
+        }
+    }
+
+    private final NetworkStreamSource.Listener networkStreamListener =
+            new NetworkStreamSource.Listener() {
+        @Override
+        public void onConnecting(String detail) {
+            if (!networkInputSelected || networkSource == null) return;
+            noSignal.setText(detail == null || detail.trim().isEmpty()
+                    ? "RTMP 网络流正在连接…" : detail);
+            noSignal.setVisibility(View.VISIBLE);
+        }
+
+        @Override
+        public void onReady(int width, int height, int fps, String formatName,
+                            boolean audioAvailable) {
+            NetworkStreamSource source = networkSource;
+            if (!networkInputSelected || source == null) return;
+            SignalInfo nextSignal = SignalInfo.network(width, height, fps, formatName);
+            boolean changed = currentSignal == null || currentSignal.width != width
+                    || currentSignal.height != height || currentSignal.fps != fps;
+            currentSignal = nextSignal;
+            previewReady = true;
+            lastGpuFrameAt = SystemClock.elapsedRealtime();
+            cameraView.setVisibility(View.INVISIBLE);
+            gpuCameraView.setVisibility(View.VISIBLE);
+            gpuCameraView.setAlpha(1f);
+            noSignal.setVisibility(View.GONE);
+            deviceInfo.setText(networkInputLabel());
+            updateSignalSummary();
+            signalModeButton.setEnabled(false);
+            mainRecordButton.setEnabled(true);
+            if (recordingController == null || (changed && !recordingController.isAnythingActive())) {
+                if (recordingController != null) recordingController.release();
+                recordingController = new RecordingController(MainActivity.this, source,
+                        currentSignal, MainActivity.this, "RTMP", true);
+            }
+            if (hdmiOutputController != null
+                    && hdmiOutputController.getMode() == HdmiOutputController.Mode.LIVE) {
+                hdmiOutputController.attachLiveSource(source);
+            }
+            refreshSettingsUi();
+            refreshAudioLevelMonitor();
+            syncRtmpStreaming();
+        }
+
+        @Override
+        public void onAudioAvailable() {
+            if (!networkInputSelected || networkSource == null) return;
+            stopAudioLevelMonitor();
+            refreshAudioLevelMonitor();
+        }
+
+        @Override
+        public void onError(String message, Throwable error) {
+            if (!networkInputSelected || networkSource == null) return;
+            previewReady = false;
+            mainRecordButton.setEnabled(false);
+            noSignal.setText("RTMP 拉流失败：" + message);
+            noSignal.setVisibility(View.VISIBLE);
+            Toast.makeText(MainActivity.this, "RTMP 拉流失败：" + message,
+                    Toast.LENGTH_LONG).show();
+        }
+    };
 
     private final DirectUvcCameraSource.Listener cameraListener =
             new DirectUvcCameraSource.Listener() {
@@ -942,51 +1741,6 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         }
     };
 
-    private final PhoneCameraSource.Listener phoneCameraListener =
-            new PhoneCameraSource.Listener() {
-        @Override
-        public void onOpened(List<Size> modes) {
-            if (phoneCameraSource == null || currentInput == null
-                    || !currentInput.isPhoneCamera()) return;
-            supportedSizes = uniqueSizes(modes);
-            supportedFormats = Collections.emptyList();
-            if (supportedSizes.isEmpty()) {
-                noSignal.setText("该手机摄像头没有可用的 4K、1080P 或 720P 输出");
-                noSignal.setVisibility(View.VISIBLE);
-                return;
-            }
-            AppSettings.SavedSignalMode saved = AppSettings.getSignalMode(
-                    MainActivity.this, currentInput.stableKey);
-            fallbackModes = buildFallbackModes(supportedSizes, saved);
-            fallbackIndex = 0;
-            bandwidthIndex = 0;
-            deviceInfo.setText(currentInput.label);
-            signalModeButton.setEnabled(true);
-            applyPhonePreviewMode(fallbackModes.get(0));
-        }
-
-        @Override
-        public void onPreviewConfigured(Size mode) {
-            // The per-request callback below owns the state transition.
-        }
-
-        @Override
-        public void onClosed() {
-            previewReady = false;
-            mainRecordButton.setEnabled(false);
-            noSignal.setText("手机摄像头已关闭");
-            noSignal.setVisibility(View.VISIBLE);
-        }
-
-        @Override
-        public void onError(Throwable error) {
-            previewReady = false;
-            mainRecordButton.setEnabled(false);
-            noSignal.setText("无法打开手机摄像头：" + readableMessage(error));
-            noSignal.setVisibility(View.VISIBLE);
-        }
-    };
-
     private void configureOpenedCamera(UsbDevice device, List<Size> sizes, List<Format> formats) {
         if (cameraSource == null || !cameraSource.isOpened()) return;
         supportedSizes = uniqueSizes(sizes);
@@ -1009,17 +1763,16 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
     }
 
     private void applyPreviewMode(Size mode, boolean allowFallback) {
-        if (phoneCameraSource != null) {
-            applyPhonePreviewMode(mode);
-            return;
-        }
         if (cameraSource == null || !cameraSource.isOpened()) return;
         if (isBusy()) {
             Toast.makeText(this, "录制中不能切换输入格式", Toast.LENGTH_SHORT).show();
             return;
         }
-        showDirectPreview();
-        if (!cameraView.getHolder().getSurface().isValid()) {
+        stopRtmpStreaming();
+        gpuCameraView.setVisibility(View.VISIBLE);
+        gpuCameraView.setAlpha(1f);
+        cameraView.setVisibility(View.INVISIBLE);
+        if (gpuScreenSurface == null || !gpuScreenSurface.isValid()) {
             selectedMode = mode.clone();
             noSignal.setText("正在等待预览画布…");
             noSignal.setVisibility(View.VISIBLE);
@@ -1043,17 +1796,14 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         noSignal.setVisibility(View.VISIBLE);
 
         int generation = ++previewGeneration;
-        AtomicInteger frameCount = new AtomicInteger();
-        cameraSource.startPreview(mode, bandwidth, cameraView.getHolder().getSurface(), frame -> {
-            if (generation != previewGeneration) return;
-            if (frameCount.incrementAndGet() == REQUIRED_TEST_FRAMES) {
-                runOnUiThread(() -> confirmPreviewMode(
-                        generation, mode, bandwidth, allowFallback));
-            }
-        }, new DirectUvcCameraSource.PreviewCallback() {
+        cameraSource.startRoutedPreview(mode, bandwidth, gpuScreenSurface,
+                gpuCameraView.getWidth(), gpuCameraView.getHeight(),
+                new DirectUvcCameraSource.PreviewCallback() {
             @Override
             public void onConfigured() {
-                if (generation == previewGeneration) noSignal.setText("等待 UVC 视频帧…");
+                if (generation == previewGeneration) {
+                    finishRoutedPreview(generation, mode, bandwidth);
+                }
             }
 
             @Override
@@ -1068,125 +1818,22 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         }, MODE_TIMEOUT_MS);
     }
 
-    private void applyPhonePreviewMode(Size mode) {
-        if (phoneCameraSource == null) return;
-        if (isBusy()) {
-            Toast.makeText(this, "录制中不能切换手机摄像头分辨率", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        selectedMode = mode.clone();
-        layoutPhonePreview(mode);
-        SurfaceTexture texture = gpuCameraView.getSurfaceTexture();
-        if (texture != null) texture.setDefaultBufferSize(mode.width, mode.height);
-        if (gpuScreenSurface == null || !gpuScreenSurface.isValid()) {
-            noSignal.setText("正在等待手机摄像头预览画布…");
-            noSignal.setVisibility(View.VISIBLE);
-            return;
-        }
-        if (recordingController != null) {
-            recordingController.release();
-            recordingController = null;
-        }
-        int generation = ++previewGeneration;
-        previewReady = false;
-        currentSignal = SignalInfo.from(mode, Collections.emptyList());
-        cameraView.setVisibility(View.GONE);
+    private void finishRoutedPreview(int generation, Size mode, float bandwidth) {
+        if (generation != previewGeneration || cameraSource == null) return;
+        modeHandler.removeCallbacksAndMessages(null);
+        currentSignal = SignalInfo.from(mode, supportedFormats);
+        cameraSource.setOutputRotation(outputRotation);
+        updateSignalSummary();
+        awaitingGpuGeneration = generation;
+        lastGpuFrameAt = 0;
         gpuCameraView.setVisibility(View.VISIBLE);
         gpuCameraView.setAlpha(1f);
-        signalInfo.setText("正在打开  " + currentSignal.displayText());
-        noSignal.setText("正在配置手机 Camera2 摄像头…");
+        cameraView.setVisibility(View.INVISIBLE);
+        noSignal.setText("正在确认稳定预览画面…");
         noSignal.setVisibility(View.VISIBLE);
-        mainRecordButton.setEnabled(false);
-        phoneCameraSource.startPreview(mode, gpuScreenSurface,
-                new PhoneCameraSource.PreviewCallback() {
-                    @Override
-                    public void onConfigured() {
-                        if (generation == previewGeneration) {
-                            completePhonePreview(generation, mode);
-                        }
-                    }
-
-                    @Override
-                    public void onError(Throwable error) {
-                        if (generation != previewGeneration) return;
-                        noSignal.setText("手机摄像头分辨率不可用：" + readableMessage(error));
-                        noSignal.setVisibility(View.VISIBLE);
-                    }
-                });
-    }
-
-    private void completePhonePreview(int generation, Size mode) {
-        if (generation != previewGeneration || phoneCameraSource == null) return;
-        currentSignal = SignalInfo.from(mode, Collections.emptyList());
-        updateSignalSummary();
-        previewReady = true;
-        noSignal.setVisibility(View.GONE);
-        mainRecordButton.setEnabled(true);
-        recordingController = new RecordingController(this, phoneCameraSource,
-                currentSignal, this);
-        if (hdmiOutputController != null
-                && hdmiOutputController.getMode() == HdmiOutputController.Mode.LIVE) {
-            hdmiOutputController.attachLiveSource(phoneCameraSource);
-        }
-        if (currentInput != null) {
-            AppSettings.saveSignalMode(this, currentInput.stableKey, selectedMode, 0);
-        }
-        refreshSettingsUi();
-        refreshAudioLevelMonitor();
-    }
-
-    private void layoutPhonePreview(Size mode) {
-        if (mode == null || currentInput == null || !currentInput.isPhoneCamera()) return;
-        gpuCameraView.post(() -> {
-            View parent = gpuCameraView.getParent() instanceof View
-                    ? (View) gpuCameraView.getParent() : null;
-            int parentWidth = parent == null ? gpuCameraView.getWidth() : parent.getWidth();
-            int parentHeight = parent == null ? gpuCameraView.getHeight() : parent.getHeight();
-            if (parentWidth <= 0 || parentHeight <= 0) return;
-            int relative = PhoneCameraCatalog.relativeRotation(this, currentInput);
-            boolean quarterTurn = relative == 90 || relative == 270;
-            int footprintWidth = quarterTurn ? mode.height : mode.width;
-            int footprintHeight = quarterTurn ? mode.width : mode.height;
-            // Single-device preview is the full-screen monitor. Use center-crop after
-            // rotation: fill the screen without changing X/Y proportions, and crop only
-            // the excess edge instead of squeezing a portrait frame into a narrow strip.
-            float scale = Math.max(parentWidth / (float) Math.max(1, footprintWidth),
-                    parentHeight / (float) Math.max(1, footprintHeight));
-            int finalWidth = Math.max(1, Math.round(footprintWidth * scale));
-            int finalHeight = Math.max(1, Math.round(footprintHeight * scale));
-            int layoutWidth = quarterTurn ? finalHeight : finalWidth;
-            int layoutHeight = quarterTurn ? finalWidth : finalHeight;
-            ViewGroup.LayoutParams existing = gpuCameraView.getLayoutParams();
-            FrameLayout.LayoutParams params = existing instanceof FrameLayout.LayoutParams
-                    ? (FrameLayout.LayoutParams) existing
-                    : new FrameLayout.LayoutParams(layoutWidth, layoutHeight, Gravity.CENTER);
-            params.width = layoutWidth;
-            params.height = layoutHeight;
-            params.gravity = Gravity.CENTER;
-            gpuCameraView.setLayoutParams(params);
-            gpuCameraView.setPivotX(layoutWidth / 2f);
-            gpuCameraView.setPivotY(layoutHeight / 2f);
-            gpuCameraView.setRotation(relative);
-            boolean mirror = PhoneCameraCatalog.isFrontFacing(this, currentInput);
-            // After a quarter turn, local X is the screen's vertical axis. Mirror local Y
-            // so the front camera still mirrors left/right on screen rather than top/bottom.
-            gpuCameraView.setScaleX(mirror && !quarterTurn ? -1f : 1f);
-            gpuCameraView.setScaleY(mirror && quarterTurn ? -1f : 1f);
-        });
-    }
-
-    private void resetPhonePreviewTransform() {
-        ViewGroup.LayoutParams existing = gpuCameraView.getLayoutParams();
-        if (existing instanceof FrameLayout.LayoutParams) {
-            FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) existing;
-            params.width = ViewGroup.LayoutParams.MATCH_PARENT;
-            params.height = ViewGroup.LayoutParams.MATCH_PARENT;
-            params.gravity = Gravity.CENTER;
-            gpuCameraView.setLayoutParams(params);
-        }
-        gpuCameraView.setRotation(0f);
-        gpuCameraView.setScaleX(1f);
-        gpuCameraView.setScaleY(1f);
+        cameraSource.setScreenSurface(gpuScreenSurface,
+                gpuCameraView.getWidth(), gpuCameraView.getHeight());
+        scheduleGpuFirstFrameCheck(generation, 0);
     }
 
     private void confirmPreviewMode(int generation, Size mode, float bandwidth,
@@ -1263,6 +1910,7 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         }
         refreshSettingsUi();
         refreshAudioLevelMonitor();
+        syncRtmpStreaming();
         AppSettings.saveSignalMode(this, currentDevice, selectedMode, bandwidthIndex);
         healthHandler.removeCallbacks(previewHealthCheck);
         healthHandler.postDelayed(previewHealthCheck, 2_000);
@@ -1271,12 +1919,16 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
     private void updateSignalSummary() {
         if (currentSignal == null) return;
         String rotationText = outputRotation == 0 ? "" : " / 旋转 " + outputRotation + "°";
-        if (phoneCameraSource != null) {
-            signalInfo.setText(currentSignal.displayText() + " / 手机摄像头");
-        } else {
-            signalInfo.setText(currentSignal.displayText() + " / USB "
-                    + Math.round(BANDWIDTH_FACTORS[bandwidthIndex] * 100) + "%" + rotationText);
+        if (phoneInputMode) {
+            signalInfo.setText(currentSignal.displayText() + " / 手机相机" + rotationText);
+            return;
         }
+        if (networkInputSelected) {
+            signalInfo.setText(currentSignal.displayText() + " / 网络拉流" + rotationText);
+            return;
+        }
+        signalInfo.setText(currentSignal.displayText() + " / USB "
+                + Math.round(BANDWIDTH_FACTORS[bandwidthIndex] * 100) + "%" + rotationText);
     }
 
     private void handleModeTimeout(int generation, boolean allowFallback, String reason) {
@@ -1312,6 +1964,10 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             Toast.makeText(this, "请先停止录制", Toast.LENGTH_SHORT).show();
             return;
         }
+        if (phoneInputMode) {
+            showPhoneCameraModeDialog();
+            return;
+        }
         if (supportedSizes.isEmpty()) return;
         List<Size> modes = new ArrayList<>(supportedSizes);
         modes.sort((left, right) -> -compareSize(left, right));
@@ -1322,8 +1978,7 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             if (sameMode(modes.get(i), currentSignal)) checked = i;
         }
         new AlertDialog.Builder(this)
-                .setTitle(phoneCameraSource != null ? "选择手机摄像头分辨率与帧率"
-                        : "选择 UVC 输入格式（黑屏优先选 MJPEG）")
+                .setTitle("选择 UVC 输入格式（黑屏优先选 MJPEG）")
                 .setSingleChoiceItems(labels, checked, (dialog, which) -> {
                     dialog.dismiss();
                     fallbackIndex = 0;
@@ -1336,6 +1991,7 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
 
     private void handleDetach(UsbDevice device) {
         if (currentDevice == null || currentDevice.getDeviceId() != device.getDeviceId()) return;
+        stopRtmpStreaming();
         previewGeneration++;
         awaitingGpuGeneration = -1;
         lastGpuFrameAt = 0;
@@ -1379,8 +2035,9 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         gpuCameraView.setAlpha(1f);
         cameraView.setVisibility(View.INVISIBLE);
         gpuCameraView.post(() -> {
-            if (cameraSource != null && gpuScreenSurface != null && previewReady) {
-                cameraSource.setScreenSurface(gpuScreenSurface,
+            UvcSurfaceSource source = activeSingleSource();
+            if (source != null && gpuScreenSurface != null && previewReady) {
+                source.setScreenSurface(gpuScreenSurface,
                         gpuCameraView.getWidth(), gpuCameraView.getHeight());
             }
         });
@@ -1485,10 +2142,10 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         int rate = AppSettings.getBitrateMbps(this);
         String rateText = rate == 0 ? getString(R.string.automatic_bitrate)
                 : getString(R.string.bitrate_mbps, rate);
-        String audioText = phoneCameraSource != null ? "手机麦克风"
-                : (AppSettings.isUsbAudioEnabled(this) ? "UAC" : "无音频");
+        String audioLabel = phoneInputMode ? phoneAudioLabel()
+                : networkInputSelected ? "网络音频" : "UAC";
         String formatText = container.label + " / " + codec.label
-                + " / " + audioText;
+                + (AppSettings.isUsbAudioEnabled(this) ? " / " + audioLabel : " / 无音频");
         recordInfo.setText(getString(R.string.record_info_format, "00:00:00", formatText, rateText));
         refreshRecordingButtons(recordingController != null && recordingController.isMainActive(),
                 recordingController != null && recordingController.isAuxActive());
@@ -1506,12 +2163,10 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
             return;
         }
         UvcSurfaceSource source = null;
-        if (AppSettings.isUsbAudioEnabled(this) && hasAudioPermission()) {
-            if (previewReady && cameraSource != null) {
-                source = cameraSource;
-            } else if (previewReady && phoneCameraSource != null) {
-                source = phoneCameraSource;
-            }
+        UvcSurfaceSource active = activeSingleSource();
+        if (AppSettings.isUsbAudioEnabled(this) && previewReady && active != null
+                && (!active.requiresRecordAudioPermission() || hasAudioPermission())) {
+            source = active;
         }
         if (source == null) {
             stopAudioLevelMonitor();
@@ -1542,10 +2197,10 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         int rate = AppSettings.getBitrateMbps(this);
         String rateText = rate == 0 ? getString(R.string.automatic_bitrate)
                 : getString(R.string.bitrate_mbps, rate);
-        String audioText = phoneCameraSource != null ? "手机麦克风"
-                : (AppSettings.isUsbAudioEnabled(this) ? "UAC" : "无音频");
+        String audioLabel = phoneInputMode ? phoneAudioLabel()
+                : networkInputSelected ? "网络音频" : "UAC";
         String formatText = container.label + " / " + codec.label
-                + " / " + audioText;
+                + (AppSettings.isUsbAudioEnabled(this) ? " / " + audioLabel : " / 无音频");
         recordInfo.setText(getString(R.string.record_info_format, duration(mainDurationMs),
                 formatText, rateText));
         auxInfo.setText(getString(R.string.aux_info_format, duration(auxDurationMs)));
@@ -1577,6 +2232,9 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         auxRecordButton.setEnabled(mainActive);
         mainRecordButton.setContentDescription(mainActive ? "停止主路录制" : "开始主路录制");
         auxRecordButton.setContentDescription(auxActive ? "停止辅路录制" : "开始辅路录制");
+        if (phoneCameraSideControls != null) {
+            phoneCameraSideControls.setRecording(mainActive);
+        }
     }
 
     private boolean isBusy() {
@@ -1598,6 +2256,20 @@ public final class MainActivity extends AppCompatActivity implements RecordingCo
         String product = device.getProductName();
         if (product != null && !product.trim().isEmpty()) return product;
         return String.format(Locale.US, "UVC %04X:%04X", device.getVendorId(), device.getProductId());
+    }
+
+    private String networkInputLabel() {
+        String url = AppSettings.getPullUrl(this);
+        String protocol = NetworkStreamSource.isHttpFlvUrl(url)
+                ? "HTTP-FLV 网络拉流" : "RTMP 网络拉流";
+        String host = Uri.parse(url).getHost();
+        return host == null || host.trim().isEmpty()
+                ? protocol : protocol + " · " + host;
+    }
+
+    private String phoneAudioLabel() {
+        PhoneAudioInputCatalog.Input input = PhoneAudioInputCatalog.selected(this);
+        return input == null || input.automatic() ? "自动麦克风" : input.label;
     }
 
     private String duration(long millis) {

@@ -32,6 +32,21 @@ public final class AppSettings {
     private static final String KEY_MULTI_AUDIO_DEVICE_ID = "multi_audio_device_id";
     private static final String KEY_MULTI_AUDIO_SOURCE_KEY = "multi_audio_source_key";
     private static final String KEY_MULTI_AUDIO_SOURCE_LABEL = "multi_audio_source_label";
+    private static final String KEY_RTMP_ENABLED = "rtmp_enabled";
+    private static final String KEY_RTMP_URL = "rtmp_url";
+    private static final String KEY_RTMP_BITRATE_MBPS = "rtmp_bitrate_mbps";
+    private static final String KEY_RTMP_MAX_HEIGHT = "rtmp_max_height";
+    private static final String KEY_RTMP_AUDIO = "rtmp_audio";
+    private static final String KEY_PULL_ENABLED = "pull_enabled";
+    private static final String KEY_PULL_URL = "pull_url";
+    private static final String KEY_NETWORK_INPUT_SELECTED = "network_input_selected";
+    private static final String KEY_INPUT_MODE = "input_mode";
+    private static final String KEY_PHONE_CAMERA_ID = "phone_camera_id";
+    private static final String KEY_PHONE_CAMERA_MODE = "phone_camera_mode";
+    private static final String KEY_PHONE_AUDIO_INPUT = "phone_audio_input";
+    private static final String KEY_VIDEO_ROTATION_UVC = "video_rotation_uvc";
+    private static final String KEY_VIDEO_ROTATION_CAMERA = "video_rotation_camera";
+    private static final String KEY_VIDEO_ROTATION_NETWORK = "video_rotation_network";
 
     private AppSettings() {
     }
@@ -78,6 +93,25 @@ public final class AppSettings {
                 return H264;
             }
         }
+    }
+
+    public enum InputMode {
+        UVC,
+        CAMERA;
+
+        static InputMode from(String value) {
+            try {
+                return InputMode.valueOf(value);
+            } catch (Exception ignored) {
+                return UVC;
+            }
+        }
+    }
+
+    public enum VideoRotationProfile {
+        UVC,
+        CAMERA,
+        NETWORK
     }
 
     private static SharedPreferences prefs(Context context) {
@@ -183,6 +217,157 @@ public final class AppSettings {
                 .apply();
     }
 
+    public static boolean isRtmpEnabled(Context context) {
+        return prefs(context).getBoolean(KEY_RTMP_ENABLED, false);
+    }
+
+    public static void setRtmpEnabled(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_RTMP_ENABLED, enabled).apply();
+    }
+
+    public static String getRtmpUrl(Context context) {
+        return prefs(context).getString(KEY_RTMP_URL, "");
+    }
+
+    public static void setRtmpUrl(Context context, String url) {
+        prefs(context).edit().putString(KEY_RTMP_URL,
+                url == null ? "" : url.trim()).apply();
+    }
+
+    public static int getRtmpBitrateMbps(Context context) {
+        return Math.max(2, Math.min(50,
+                prefs(context).getInt(KEY_RTMP_BITRATE_MBPS, 8)));
+    }
+
+    public static void setRtmpBitrateMbps(Context context, int value) {
+        prefs(context).edit().putInt(KEY_RTMP_BITRATE_MBPS,
+                Math.max(2, Math.min(50, value))).apply();
+    }
+
+    /** Zero follows the input signal; other values cap the streaming height. */
+    public static int getRtmpMaxHeight(Context context) {
+        int value = prefs(context).getInt(KEY_RTMP_MAX_HEIGHT, 1080);
+        return value == 0 || value == 720 || value == 1080 ? value : 1080;
+    }
+
+    public static void setRtmpMaxHeight(Context context, int value) {
+        int safe = value == 0 || value == 720 || value == 1080 ? value : 1080;
+        prefs(context).edit().putInt(KEY_RTMP_MAX_HEIGHT, safe).apply();
+    }
+
+    public static boolean isRtmpAudioEnabled(Context context) {
+        return prefs(context).getBoolean(KEY_RTMP_AUDIO, true);
+    }
+
+    public static void setRtmpAudioEnabled(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_RTMP_AUDIO, enabled).apply();
+    }
+
+    public static boolean isPullEnabled(Context context) {
+        return prefs(context).getBoolean(KEY_PULL_ENABLED, false);
+    }
+
+    public static void setPullEnabled(Context context, boolean enabled) {
+        prefs(context).edit().putBoolean(KEY_PULL_ENABLED, enabled).apply();
+        if (!enabled) setNetworkInputSelected(context, false);
+    }
+
+    public static String getPullUrl(Context context) {
+        return prefs(context).getString(KEY_PULL_URL, "");
+    }
+
+    public static void setPullUrl(Context context, String url) {
+        prefs(context).edit().putString(KEY_PULL_URL,
+                url == null ? "" : url.trim()).apply();
+    }
+
+    public static boolean isNetworkInputSelected(Context context) {
+        return prefs(context).getBoolean(KEY_NETWORK_INPUT_SELECTED, false);
+    }
+
+    public static void setNetworkInputSelected(Context context, boolean selected) {
+        prefs(context).edit().putBoolean(KEY_NETWORK_INPUT_SELECTED, selected).apply();
+    }
+
+    public static InputMode getInputMode(Context context) {
+        return InputMode.from(prefs(context).getString(KEY_INPUT_MODE, InputMode.UVC.name()));
+    }
+
+    public static void setInputMode(Context context, InputMode mode) {
+        InputMode safe = mode == null ? InputMode.UVC : mode;
+        SharedPreferences.Editor editor = prefs(context).edit()
+                .putString(KEY_INPUT_MODE, safe.name());
+        if (safe == InputMode.CAMERA) {
+            editor.putBoolean(KEY_NETWORK_INPUT_SELECTED, false);
+        }
+        editor.apply();
+    }
+
+    public static int getVideoRotation(Context context, VideoRotationProfile profile) {
+        return normalizeRotation(prefs(context).getInt(rotationKey(profile), 0));
+    }
+
+    public static void setVideoRotation(Context context, VideoRotationProfile profile,
+                                        int degrees) {
+        prefs(context).edit().putInt(rotationKey(profile),
+                normalizeRotation(degrees)).apply();
+    }
+
+    private static String rotationKey(VideoRotationProfile profile) {
+        if (profile == VideoRotationProfile.CAMERA) return KEY_VIDEO_ROTATION_CAMERA;
+        if (profile == VideoRotationProfile.NETWORK) return KEY_VIDEO_ROTATION_NETWORK;
+        return KEY_VIDEO_ROTATION_UVC;
+    }
+
+    static int normalizeRotation(int degrees) {
+        int normalized = Math.floorMod(degrees, 360);
+        return normalized % 90 == 0 ? normalized : 0;
+    }
+
+    public static String getPhoneCameraId(Context context) {
+        return prefs(context).getString(KEY_PHONE_CAMERA_ID, "");
+    }
+
+    public static void setPhoneCameraId(Context context, String cameraId) {
+        prefs(context).edit().putString(KEY_PHONE_CAMERA_ID,
+                cameraId == null ? "" : cameraId).apply();
+    }
+
+    public static String getPhoneAudioInput(Context context) {
+        return prefs(context).getString(KEY_PHONE_AUDIO_INPUT,
+                PhoneAudioInputCatalog.AUTO_KEY);
+    }
+
+    public static void setPhoneAudioInput(Context context, String key) {
+        String safe = key == null || key.trim().isEmpty()
+                ? PhoneAudioInputCatalog.AUTO_KEY : key;
+        prefs(context).edit().putString(KEY_PHONE_AUDIO_INPUT, safe).apply();
+    }
+
+    public static void savePhoneCameraMode(Context context, String cameraId,
+                                           int width, int height, int fps) {
+        if (cameraId == null || cameraId.trim().isEmpty()) return;
+        prefs(context).edit()
+                .putString(KEY_PHONE_CAMERA_ID, cameraId)
+                .putString(KEY_PHONE_CAMERA_MODE,
+                        width + "," + height + "," + Math.max(1, fps))
+                .apply();
+    }
+
+    @Nullable
+    public static int[] getPhoneCameraMode(Context context) {
+        String value = prefs(context).getString(KEY_PHONE_CAMERA_MODE, null);
+        if (value == null) return null;
+        String[] fields = value.split(",");
+        if (fields.length != 3) return null;
+        try {
+            return new int[]{Integer.parseInt(fields[0]), Integer.parseInt(fields[1]),
+                    Integer.parseInt(fields[2])};
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
     @Nullable
     public static Uri getTreeUri(Context context) {
         String value = prefs(context).getString(KEY_TREE_URI, null);
@@ -216,30 +401,10 @@ public final class AppSettings {
         prefs(context).edit().putString(signalModeKey(device), value).apply();
     }
 
-    public static void saveSignalMode(Context context, String inputKey, Size size,
-                                      int bandwidthIndex) {
-        if (inputKey == null || inputKey.trim().isEmpty() || size == null) return;
-        String value = size.type + "," + size.width + "," + size.height + ","
-                + size.fps + "," + Math.max(0, bandwidthIndex);
-        prefs(context).edit().putString(signalModeKey(inputKey), value).apply();
-    }
-
     @Nullable
     public static SavedSignalMode getSignalMode(Context context, UsbDevice device) {
         if (device == null) return null;
         String value = prefs(context).getString(signalModeKey(device), null);
-        return parseSavedSignalMode(value);
-    }
-
-    @Nullable
-    public static SavedSignalMode getSignalMode(Context context, String inputKey) {
-        if (inputKey == null || inputKey.trim().isEmpty()) return null;
-        String value = prefs(context).getString(signalModeKey(inputKey), null);
-        return parseSavedSignalMode(value);
-    }
-
-    @Nullable
-    private static SavedSignalMode parseSavedSignalMode(String value) {
         if (value == null) return null;
         String[] fields = value.split(",");
         if (fields.length != 5) return null;
@@ -256,29 +421,16 @@ public final class AppSettings {
         return KEY_SIGNAL_MODE_PREFIX + device.getVendorId() + "_" + device.getProductId();
     }
 
-    private static String signalModeKey(String stableKey) {
-        return KEY_SIGNAL_MODE_PREFIX + Integer.toHexString(stableKey.hashCode());
-    }
-
     public static void savePreferredDevice(Context context, UsbDevice device) {
         if (device == null) return;
-        savePreferredInput(context, UsbDeviceCatalog.stableKey(device));
+        prefs(context).edit().putString(KEY_PREFERRED_DEVICE,
+                device.getVendorId() + ":" + device.getProductId()).apply();
     }
 
     public static boolean isPreferredDevice(Context context, UsbDevice device) {
         if (device == null) return false;
         String value = prefs(context).getString(KEY_PREFERRED_DEVICE, null);
-        return value != null && (value.equals(UsbDeviceCatalog.stableKey(device))
-                || value.equals(device.getVendorId() + ":" + device.getProductId()));
-    }
-
-    public static void savePreferredInput(Context context, String stableKey) {
-        if (stableKey == null || stableKey.trim().isEmpty()) return;
-        prefs(context).edit().putString(KEY_PREFERRED_DEVICE, stableKey).apply();
-    }
-
-    public static String getPreferredInputKey(Context context) {
-        return prefs(context).getString(KEY_PREFERRED_DEVICE, "");
+        return value != null && value.equals(device.getVendorId() + ":" + device.getProductId());
     }
 
     public static void saveMultiDevices(Context context, List<UsbDevice> devices) {
@@ -290,19 +442,6 @@ public final class AppSettings {
         for (UsbDevice device : devices) {
             if (value.length() > 0) value.append('\n');
             value.append(UsbDeviceCatalog.stableKey(device));
-        }
-        prefs(context).edit().putString(KEY_MULTI_DEVICES, value.toString()).apply();
-    }
-
-    public static void saveMultiInputs(Context context, List<VideoInputDevice> devices) {
-        if (devices == null || devices.size() < 2) {
-            clearMultiDevices(context);
-            return;
-        }
-        StringBuilder value = new StringBuilder();
-        for (VideoInputDevice device : devices) {
-            if (value.length() > 0) value.append('\n');
-            value.append(device.stableKey);
         }
         prefs(context).edit().putString(KEY_MULTI_DEVICES, value.toString()).apply();
     }

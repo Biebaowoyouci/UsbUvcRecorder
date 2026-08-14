@@ -57,6 +57,229 @@
         android:visibility="gone" />
 
     <LinearLayout
+        android:id="@+id/camera_mode_panel"
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent"
+        android:layout_gravity="end|center_vertical"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingTop="14dp"
+        android:paddingEnd="10dp"
+        android:paddingBottom="14dp"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:id="@+id/camera_adjustment_panel"
+            android:layout_width="340dp"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="10dp"
+            android:background="@drawable/bg_panel"
+            android:orientation="vertical"
+            android:padding="14dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/camera_adjustment_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/white"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <Spinner
+                android:id="@+id/camera_adjustment_spinner"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="8dp"
+                android:backgroundTint="@color/accent"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/camera_adjustment_value_one"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="@color/white"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <SeekBar
+                android:id="@+id/camera_adjustment_seek_one"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/camera_adjustment_value_two"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="@color/white"
+                android:textSize="14sp"
+                android:visibility="gone" />
+
+            <SeekBar
+                android:id="@+id/camera_adjustment_seek_two"
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/camera_adjustment_action"
+                style="@style/OverlayButton"
+                android:layout_width="match_parent"
+                android:layout_height="46dp"
+                android:layout_marginTop="8dp"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/camera_adjustment_close"
+                style="@style/OverlayButton"
+                android:layout_width="match_parent"
+                android:layout_height="42dp"
+                android:layout_marginTop="8dp"
+                android:text="收起" />
+        </LinearLayout>
+
+        <ScrollView
+            android:layout_width="92dp"
+            android:layout_height="match_parent"
+            android:fillViewport="true"
+            android:overScrollMode="never"
+            android:scrollbars="none">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center"
+                android:orientation="vertical">
+
+                <Button
+                    android:id="@+id/camera_focus_quick"
+                    style="@style/OverlayButton"
+                    android:layout_width="88dp"
+                    android:layout_height="48dp"
+                    android:layout_marginBottom="6dp"
+                    android:minWidth="0dp"
+                    android:text="对焦" />
+
+                <Button
+                    android:id="@+id/camera_zoom_quick"
+                    style="@style/OverlayButton"
+                    android:layout_width="88dp"
+                    android:layout_height="48dp"
+                    android:layout_marginBottom="6dp"
+                    android:minWidth="0dp"
+                    android:text="缩放" />
+
+                <Button
+                    android:id="@+id/camera_brightness_quick"
+                    style="@style/OverlayButton"
+                    android:layout_width="88dp"
+                    android:layout_height="48dp"
+                    android:layout_marginBottom="6dp"
+                    android:minWidth="0dp"
+                    android:text="亮度" />
+
+                <Button
+                    android:id="@+id/camera_awb_quick"
+                    style="@style/OverlayButton"
+                    android:layout_width="88dp"
+                    android:layout_height="48dp"
+                    android:layout_marginBottom="6dp"
+                    android:minWidth="0dp"
+                    android:text="白平衡" />
+
+                <Button
+                    android:id="@+id/camera_beauty_quick"
+                    style="@style/OverlayButton"
+                    android:layout_width="88dp"
+                    android:layout_height="48dp"
+                    android:layout_marginBottom="6dp"
+                    android:minWidth="0dp"
+                    android:text="美颜" />
+
+                <Button
+                    android:id="@+id/camera_exposure_quick"
+                    style="@style/OverlayButton"
+                    android:layout_width="88dp"
+                    android:layout_height="48dp"
+                    android:layout_marginBottom="6dp"
+                    android:minWidth="0dp"
+                    android:text="曝光" />
+
+                <Button
+                    android:id="@+id/camera_microphone_quick"
+                    style="@style/OverlayButton"
+                    android:layout_width="88dp"
+                    android:layout_height="48dp"
+                    android:layout_marginBottom="6dp"
+                    android:minWidth="0dp"
+                    android:text="麦克风" />
+
+                <Button
+                    android:id="@+id/camera_frame_quick"
+                    style="@style/OverlayButton"
+                    android:layout_width="88dp"
+                    android:layout_height="48dp"
+                    android:layout_marginBottom="6dp"
+                    android:minWidth="0dp"
+                    android:text="画面" />
+
+                <Button
+                    android:id="@+id/camera_format_quick"
+                    style="@style/OverlayButton"
+                    android:layout_width="88dp"
+                    android:layout_height="48dp"
+                    android:minWidth="0dp"
+                    android:text="格式" />
+            </LinearLayout>
+        </ScrollView>
+
+        <LinearLayout
+            android:layout_width="112dp"
+            android:layout_height="match_parent"
+            android:layout_marginStart="8dp"
+            android:gravity="center"
+            android:orientation="vertical">
+
+            <Button
+                android:id="@+id/camera_switch_quick"
+                style="@style/OverlayButton"
+                android:layout_width="104dp"
+                android:layout_height="56dp"
+                android:text="切换镜头" />
+
+            <Button
+                android:id="@+id/camera_transmit_quick"
+                style="@style/OverlayButton"
+                android:layout_width="104dp"
+                android:layout_height="56dp"
+                android:layout_marginTop="18dp"
+                android:text="传输" />
+
+            <Button
+                android:id="@+id/camera_record_quick"
+                android:layout_width="104dp"
+                android:layout_height="64dp"
+                android:layout_marginTop="18dp"
+                android:background="@drawable/bg_record_red"
+                android:text="录制"
+                android:textColor="@color/white"
+                android:textSize="16sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/camera_settings_quick"
+                style="@style/OverlayButton"
+                android:layout_width="104dp"
+                android:layout_height="56dp"
+                android:layout_marginTop="18dp"
+                android:text="设置" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout
         android:id="@+id/control_overlay"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
@@ -108,6 +331,16 @@
                 android:textColor="@color/record_orange"
                 android:textSize="12sp"
                 android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/rtmp_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="@string/rtmp_status_idle"
+                android:textColor="@color/accent"
+                android:textSize="12sp"
+                android:visibility="gone" />
         </LinearLayout>
 
         <Space
@@ -116,6 +349,7 @@
             android:layout_weight="1" />
 
         <HorizontalScrollView
+            android:id="@+id/bottom_controls_scroll"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:fillViewport="true"

@@ -13,3 +13,10 @@ under the Apache License 2.0.
 
 AndroidX and Material Components dependencies are used under their respective
 Apache License 2.0 terms.
+
+[RootEncoder](https://github.com/pedroSG94/RootEncoder) 2.7.5 is used for
+RTMP/RTMPS publishing under the Apache License 2.0.
+
+[AndroidX Media3](https://github.com/androidx/media) 1.10.1, including its
+ExoPlayer and RTMP data source modules, is used for RTMP input playback under
+the Apache License 2.0.

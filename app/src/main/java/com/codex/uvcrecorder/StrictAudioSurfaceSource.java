@@ -26,6 +26,11 @@ final class StrictAudioSurfaceSource implements UvcSurfaceSource {
     }
 
     @Override
+    public void addRecordingSurface(Surface surface, int width, int height) throws Exception {
+        videoSource.addRecordingSurface(surface, width, height);
+    }
+
+    @Override
     public void removeRecordingSurface(Surface surface) {
         videoSource.removeRecordingSurface(surface);
     }
@@ -48,6 +53,16 @@ final class StrictAudioSurfaceSource implements UvcSurfaceSource {
     @Override
     public int getOutputRotation() {
         return videoSource.getOutputRotation();
+    }
+
+    @Override
+    public long getVideoTimelinePositionUs() {
+        return videoSource.getVideoTimelinePositionUs();
+    }
+
+    @Override
+    public int getTimelineGeneration() {
+        return videoSource.getTimelineGeneration();
     }
 
     @Override

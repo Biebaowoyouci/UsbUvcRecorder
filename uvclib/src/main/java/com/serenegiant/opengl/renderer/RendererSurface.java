@@ -91,7 +91,10 @@ class RendererSurface {
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
             drawer.setMvpMatrix(mUseCustomMvpMatrix ? mMvpMatrix : mvpMatrix, 0);
             drawer.draw(textId, texMatrix, 0);
-            mEGLSurface.swap();
+            // Encoder-backed slave surfaces must use the device monotonic
+            // clock, like Android screen recording. This prevents RTMP source
+            // timestamp jumps from leaking into recorded video.
+            mEGLSurface.swap(Time.nanoTime());
         }
     }
 
